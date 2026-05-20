@@ -8,3 +8,14 @@
 #   http://developer.android.com/guide/developing/tools/proguard.html
 
 # Add any project specific keep options here:
+
+# VisionCamera Frame Processor - prevent obfuscation
+-keep class com.mrousavy.camera.** { *; }
+-keep interface com.mrousavy.camera.** { *; }
+-keepclassmembers class com.mrousavy.camera.** { *; }
+-keep class com.mrousavy.camera.frameprocessors.** { *; }
+-keep interface com.mrousavy.camera.frameprocessors.** { *; }
+-keepclassmembers class com.mrousavy.camera.frameprocessors.** { *; }
+-keepclassmembers class com.mrousavy.camera.frameprocessors.SharedArray { *; }
+-keepclassmembers class com.mrousavy.camera.frameprocessors.FrameProcessor { *; }
+-dontwarn com.mrousavy.camera.**
