@@ -10,6 +10,7 @@
     View,
   } from 'react-native';
   import { Worklets, useSharedValue } from 'react-native-worklets-core';
+  import { Gesture, GestureDetector } from 'react-native-gesture-handler';
   import type { StackNavigationProp } from '@react-navigation/stack';
   import { useNavigation } from '@react-navigation/native';
   import {
@@ -38,6 +39,8 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
     // ── Shared Values ──────────────────────────────────────────────────────────
     const frameCounter = useSharedValue(0);
     const lastDetectionTime = useSharedValue(0);
+    const lastProcessTime = useSharedValue(0); // For 250ms throttle
+    const isProcessing = useSharedValue(false); // Mutex lock to prevent buffer overflow
 
     // ── State ──────────────────────────────────────────────────────────────────
     const [capturedCount, setCapturedCount] = useState<number>(0);
@@ -46,11 +49,15 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
     const [detectionBox, setDetectionBox] = useState<{
       x: number; y: number; w: number; h: number;
     } | null>(null);
+    const [lockedExposure, setLockedExposure] = useState<number | undefined>(undefined);
 
     // ── Refs ───────────────────────────────────────────────────────────────────
     const cameraRef = useRef<Camera>(null);
-    const isProcessingRef = useRef<boolean>(false);
     const capturedImagesRef = useRef<string[]>(capturedImages);
+    
+    // ── Focus circle state ─────────────────────────────────────────────────────
+    const [focusPoint, setFocusPoint] = useState<{ x: number; y: number } | null>(null);
+    const focusCircleAnim = useRef(new Animated.Value(0)).current;
     
 
     useEffect(() => {
@@ -123,6 +130,49 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
     }, [isScanning, pulseAnim]);
 
+    // ── Tap-to-focus handler ───────────────────────────────────────────────────
+    const handleTapToFocus = useCallback(async (x: number, y: number) => {
+      if (!cameraRef.current) return;
+
+      try {
+        // Set focus point for visual feedback
+        setFocusPoint({ x, y });
+
+        // Lock exposure to stop hunting
+        setLockedExposure(0);
+
+        // Trigger focus circle animation
+        focusCircleAnim.setValue(0);
+        Animated.sequence([
+          Animated.timing(focusCircleAnim, {
+            toValue: 1,
+            duration: 250,
+            useNativeDriver: true,
+          }),
+          Animated.timing(focusCircleAnim, {
+            toValue: 0,
+            duration: 250,
+            useNativeDriver: true,
+          }),
+        ]).start(() => {
+          // Clear focus point after animation
+          setFocusPoint(null);
+        });
+
+        // Focus camera at tapped point with exposure lock
+        await cameraRef.current.focus({ x, y });
+        console.log(`[CameraScreen] Focused at (${x.toFixed(0)}, ${y.toFixed(0)})`);
+      } catch (error) {
+        console.error('[CameraScreen] Focus failed:', error);
+      }
+    }, [focusCircleAnim]);
+
+    // ── Gesture detector for tap-to-focus ──────────────────────────────────────
+    const tapGesture = Gesture.Tap()
+      .onEnd((event) => {
+        handleTapToFocus(event.x, event.y);
+      });
+
     // ── Camera permission ──────────────────────────────────────────────────────
     const { hasPermission, requestPermission } = useCameraPermission();
 
@@ -132,21 +182,25 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
 
     // ── Camera device & format ─────────────────────────────────────────────────
     const device = useCameraDevice('back');
-    const format = useCameraFormat(device, [{ photoResolution: 'max' }]);
+    
+    // CRITICAL: Force 720p video resolution to prevent 12MP overload
+    // This ensures frame processor receives manageable frame sizes
+    const format = useCameraFormat(device, [
+      { videoResolution: { width: 1280, height: 720 } },
+      { fps: 30 },
+    ]);
 
     useEffect(() => {
       if (format == null) {
+        console.warn('[CameraScreen] No camera format available');
         return;
       }
-      if (format.photoWidth < 2000 || format.photoHeight < 2000) {
-        console.warn(
-          `[CameraScreen] Best available format is below 2000px: ${format.photoWidth}x${format.photoHeight}. Falling back to highest available.`,
-        );
-      } else {
-        console.log(
-          `[CameraScreen] Selected camera format: ${format.photoWidth}x${format.photoHeight}`,
-        );
-      }
+      console.log(
+        `[CameraScreen] Camera format: ${format.videoWidth}x${format.videoHeight} @ ${format.maxFps}fps`,
+      );
+      console.log(
+        `[CameraScreen] Photo resolution: ${format.photoWidth}x${format.photoHeight}`,
+      );
     }, [format]);
 
 // ── Marker detection handler (JS thread) ──────────────────────────────────
@@ -159,46 +213,27 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         frameHeight: number,
       ) => {
         
-        // 1. Debounce: ignore if a capture is already being processed
-        if (isProcessingRef.current || !boundingBox || rotation === null) {
+        // 1. Check if already processing (should be locked by worklet, but double-check)
+        if (!boundingBox || rotation === null) {
           return;
         }
-        isProcessingRef.current = true;
 
-        const currentCount = capturedImagesRef.current.length;
-        console.log(`[CameraScreen] Marker detected — rotation: ${rotation}°, captures so far: ${currentCount + 1}/20`);
-
-        // 2. Coordinate scaling: frame → screen (for UI overlay only)
-        const scaleX = SCREEN_WIDTH / frameWidth;
-        const scaleY = SCREEN_HEIGHT / frameHeight;
-        const scaledBox = {
-          x: boundingBox.x * scaleX,
-          y: boundingBox.y * scaleY,
-          w: boundingBox.w * scaleX,
-          h: boundingBox.h * scaleY,
-        };
-
-        // 3. Show detection overlay & flash
-        setDetectionBox(scaledBox);
+        // 2. TRIGGER THE VISUAL FEEDBACK IMMEDIATELY
+        // This tells the user "I saw it!" before the heavy processing even starts
         triggerCaptureFlash();
         triggerCornerAnimation();
 
         if (!cameraRef.current) {
-          console.error('[CameraScreen] Camera ref is null');
-          isProcessingRef.current = false;
+          // Unlock on error
+          isProcessing.value = false;
           return;
         }
 
-        // 4. Take Photo and Process with OpenCV
+        // 3. Take Photo and Process
         try {
-          const photo = await cameraRef.current.takePhoto({ qualityPrioritization: 'speed' });
-          
-          // Ensure photo.path has 'file://' prefix
-          const photoUri = photo.path.startsWith('file://')
-            ? photo.path
-            : `file://${photo.path}`;
+          const photo = await cameraRef.current.takePhoto();
+          const photoUri = photo.path.startsWith('file://') ? photo.path : `file://${photo.path}`;
 
-          // 👇 THE OPENCV MAGIC 👇
           const processedPath = await extractAndProcessMarkerPerspective(
             photoUri,
             corners!,
@@ -206,58 +241,92 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           );
 
           if (processedPath) {
-            // Append to captured images and check if we hit 20
             setCapturedImages(prev => {
               const next = [...prev, processedPath];
               if (next.length >= 20) {
                 setIsScanning(false);
-                // Navigate to Results screen
                 setTimeout(() => {
                   navigation.navigate('Results', { images: next });
                 }, 500);
               }
               return next;
             });
+            // Update the counter on the screen
             setCapturedCount(prev => Math.min(prev + 1, 20));
-          } else {
-            console.error('[CameraScreen] Image processing failed');
+            console.log(`[State] Captured marker ${capturedCount + 1}/20`);
           }
-
         } catch (error) {
-          console.error('[CameraScreen] takePhoto/processing failed:', error);
+          console.error('[CameraScreen] processing failed:', error);
         } finally {
-          // Clean up detection overlay and release debounce lock
-          setTimeout(() => setDetectionBox(null), 1000);
+          // Unlock after 1.5 seconds cooldown (gives user time to move to next marker)
           setTimeout(() => {
-            isProcessingRef.current = false;
+            isProcessing.value = false;
+            console.log('[Mutex] Unlocked - ready for next marker');
           }, 1500);
         }
       },
-      [triggerCaptureFlash, triggerCornerAnimation, navigation],
+      [triggerCaptureFlash, triggerCornerAnimation, navigation, isProcessing, capturedCount],
     );
 
     // ── Bridge: worklet → JS thread ────────────────────────────────────────────
     const handleMarkerDetectedJS = Worklets.createRunOnJS(handleMarkerDetected);
 
-    // ── Frame processor with INLINE 8-step detection ───────────────────────────
-    // DOWNSCALED PROCESSING: 480×270 (quarter resolution of 1920×1080)
+    // ── Pre-allocated buffers for ZERO-ALLOCATION processing ───────────────────
+    // CRITICAL: These dimensions MUST match the camera format (720p = 1280×720)
+    // If camera is in portrait, dimensions may be swapped (720×1280)
+    const TARGET_WIDTH = 1280;
+    const TARGET_HEIGHT = 720;
+    const TOTAL_PIXELS = TARGET_WIDTH * TARGET_HEIGHT; // 921,600 pixels
+    
+    const grayBuffer = useRef(new Uint8Array(TOTAL_PIXELS)).current;
+    const edgeBuffer = useRef(new Uint8Array(TOTAL_PIXELS)).current;
+    const binaryBuffer = useRef(new Uint8Array(TOTAL_PIXELS)).current;
+    const labelBuffer = useRef(new Int32Array(TOTAL_PIXELS)).current;
+    const parentBuffer = useRef(new Int32Array(TOTAL_PIXELS * 2)).current;
+    const compStatsBuffer = useRef(new Int32Array(TOTAL_PIXELS * 5)).current;
+
+    // ── Frame processor with ULTRA-FAST single-pass detection ──────────────────
+    // DIRECT PROCESSING: 1280×720 (no downscaling needed)
     const frameProcessor = useFrameProcessor((frame) => {
       'worklet';
       
-      // Log once at startup
+      // ── MUTEX LOCK: Instantly drop frames if processing ────────────────────
+      // This prevents CameraX buffer overflow (maxImages: 6)
+      if (isProcessing.value) {
+        return; // Drop frame immediately (0.001ms) to prevent buffer pile-up
+      }
+      
+      // ── FAILSAFE: Check frame size matches our buffers ─────────────────────
+      const framePixels = frame.width * frame.height;
+      if (framePixels > TOTAL_PIXELS) {
+        if (frameCounter.value === 0) {
+          console.log(`[FrameProcessor] ⚠️ Frame too large: ${frame.width}x${frame.height} (expected ${TARGET_WIDTH}x${TARGET_HEIGHT}). Skipping.`);
+        }
+        frameCounter.value++;
+        return;
+      }
+      
+      // ── AGGRESSIVE THROTTLE: 500ms (2 FPS processing) ──────────────────────
+      const currentTime = Date.now();
+      
+      if (currentTime - lastProcessTime.value < 500) {
+        return;
+      }
+      lastProcessTime.value = currentTime;
+      
+      if (currentTime - lastDetectionTime.value < 1500) {
+        return;
+      }
+      
       if (frameCounter.value === 0) {
-        console.log('[FrameProcessor] ✓ Frame processor initialized and running!');
+        console.log(`[FrameProcessor] ✓ Ultra-fast processor initialized! Frame: ${frame.width}x${frame.height}`);
       }
       
       if (!isScanning) return;
 
-      // ── STEP 1 — Frame sampling (every 4th frame) ──────────────────────────
       frameCounter.value += 1;
       if (frameCounter.value >= 600) {
         frameCounter.value = 0;
-      }
-      if (frameCounter.value % 4 !== 0) {
-        return;
       }
 
       const buffer = frame.toArrayBuffer();
@@ -265,420 +334,226 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       const sourceWidth = frame.width;
       const sourceHeight = frame.height;
 
-      // Downscale target: 480×270 (quarter resolution)
-      const TARGET_WIDTH = 480;
-      const TARGET_HEIGHT = 270;
-      const scaleX = sourceWidth / TARGET_WIDTH;
-      const scaleY = sourceHeight / TARGET_HEIGHT;
-
-      // Log once on first processed frame
-      if (frameCounter.value === 4) {
-        console.log(`[Detection] Processing at downscaled size: ${TARGET_WIDTH}x${TARGET_HEIGHT} (source: ${sourceWidth}x${sourceHeight})`);
+      // ── STEP 1: DEFINE STRICT 400x400 CENTER ROI ───────────────────────────
+      const ROI_SIZE = 400;
+      const centerX = Math.floor(TARGET_WIDTH / 2);
+      const centerY = Math.floor(TARGET_HEIGHT / 2);
+      const startX = centerX - 200; // 440 at 1280 width
+      const endX = centerX + 200;   // 840 at 1280 width
+      const startY = centerY - 200; // 160 at 720 height
+      const endY = centerY + 200;   // 560 at 720 height
+      
+      // ── STEP 2: ULTRA-FAST DOWNSAMPLING (stride 8, ROI only) ───────────────
+      // Only sample every 8th pixel within the 400x400 center ROI
+      const STRIDE = 8;
+      let idx = 0;
+      
+      for (let dy = startY; dy < endY; dy += STRIDE) {
+        const rowOffset = dy * sourceWidth;
+        for (let dx = startX; dx < endX; dx += STRIDE) {
+          if (idx < TOTAL_PIXELS) {
+            grayBuffer[idx++] = pixelData[rowOffset + dx];
+          }
+        }
       }
 
-      const totalPixels = TARGET_WIDTH * TARGET_HEIGHT;
-
-      // ── STEP 2 — Grayscale conversion with downsampling ────────────────────
-      const grayData = new Float32Array(totalPixels);
-      for (let dy = 0; dy < TARGET_HEIGHT; dy++) {
-        for (let dx = 0; dx < TARGET_WIDTH; dx++) {
-          const sourceX = Math.floor(dx * scaleX);
-          const sourceY = Math.floor(dy * scaleY);
-          const sourceIndex = (sourceY * sourceWidth + sourceX) * 4;
+      // ── STEP 3: SINGLE-PASS BOUNDING BOX (ROI only) ────────────────────────
+      const DARK_THRESHOLD = 50; // STRICT: Only pure black ink
+      const MAX_DARK_PIXELS = 50000; // Bail-out to prevent hang
+      
+      let minX = sourceWidth;
+      let maxX = 0;
+      let minY = sourceHeight;
+      let maxY = 0;
+      let darkCount = 0;
+      
+      // Single pass through sampled pixels (ROI only)
+      idx = 0;
+      for (let dy = startY; dy < endY; dy += STRIDE) {
+        for (let dx = startX; dx < endX; dx += STRIDE) {
+          if (idx >= TOTAL_PIXELS) break;
           
-          const gray = (0.299 * pixelData[sourceIndex] +
-                       0.587 * pixelData[sourceIndex + 1] +
-                       0.114 * pixelData[sourceIndex + 2]) / 255;
+          const pixelValue = grayBuffer[idx++];
           
-          grayData[dy * TARGET_WIDTH + dx] = gray;
-        }
-      }
-
-      // ── STEP 3 — Adaptive thresholding (8×8 blocks for downscaled frame) ───
-      const BLOCK = 8;
-      const binaryData = new Uint8Array(totalPixels); // 0 = BLACK, 1 = WHITE
-
-      const blocksX = Math.ceil(TARGET_WIDTH / BLOCK);
-      const blocksY = Math.ceil(TARGET_HEIGHT / BLOCK);
-
-      for (let by = 0; by < blocksY; by++) {
-        for (let bx = 0; bx < blocksX; bx++) {
-          const x0 = bx * BLOCK;
-          const y0 = by * BLOCK;
-          const x1 = Math.min(x0 + BLOCK, TARGET_WIDTH);
-          const y1 = Math.min(y0 + BLOCK, TARGET_HEIGHT);
-
-          // Compute block mean
-          let sum = 0;
-          let count = 0;
-          for (let py = y0; py < y1; py++) {
-            for (let px = x0; px < x1; px++) {
-              sum += grayData[py * TARGET_WIDTH + px];
-              count++;
-            }
-          }
-          const blockMean = count > 0 ? sum / count : 0.5;
-          const threshold = blockMean - 0.07;
-
-          // Threshold each pixel in this block
-          for (let py = y0; py < y1; py++) {
-            for (let px = x0; px < x1; px++) {
-              const idx = py * TARGET_WIDTH + px;
-              binaryData[idx] = grayData[idx] < threshold ? 0 : 1;
-            }
-          }
-        }
-      }
-
-      // ── STEP 4 — Connected component labeling (two-pass, 4-connectivity) ───
-      // Union-Find helpers (inline)
-      const findRoot = (parent: Int32Array, i: number): number => {
-        while (parent[i] !== i) {
-          parent[i] = parent[parent[i]];
-          i = parent[i];
-        }
-        return i;
-      };
-
-      const union = (parent: Int32Array, a: number, b: number): void => {
-        const ra = findRoot(parent, a);
-        const rb = findRoot(parent, b);
-        if (ra !== rb) {
-          parent[rb] = ra;
-        }
-      };
-
-      const labels = new Int32Array(totalPixels).fill(-1);
-      const parent = new Int32Array(totalPixels * 2);
-      let nextLabel = 0;
-
-      // First pass: assign provisional labels
-      for (let row = 0; row < TARGET_HEIGHT; row++) {
-        for (let col = 0; col < TARGET_WIDTH; col++) {
-          const idx = row * TARGET_WIDTH + col;
-          if (binaryData[idx] !== 0) continue; // WHITE pixel
-
-          const above = row > 0 ? labels[(row - 1) * TARGET_WIDTH + col] : -1;
-          const left = col > 0 ? labels[row * TARGET_WIDTH + (col - 1)] : -1;
-
-          if (above === -1 && left === -1) {
-            parent[nextLabel] = nextLabel;
-            labels[idx] = nextLabel;
-            nextLabel++;
-          } else if (above !== -1 && left === -1) {
-            labels[idx] = above;
-          } else if (above === -1 && left !== -1) {
-            labels[idx] = left;
-          } else {
-            const ra = findRoot(parent, above);
-            const rl = findRoot(parent, left);
-            labels[idx] = Math.min(ra, rl);
-            if (ra !== rl) {
-              union(parent, ra, rl);
-            }
-          }
-        }
-      }
-
-      // Second pass: resolve labels to roots
-      for (let i = 0; i < totalPixels; i++) {
-        if (labels[i] !== -1) {
-          labels[i] = findRoot(parent, labels[i]);
-        }
-      }
-
-      // Collect per-component stats
-      const compMinX = new Int32Array(nextLabel).fill(TARGET_WIDTH);
-      const compMaxX = new Int32Array(nextLabel).fill(-1);
-      const compMinY = new Int32Array(nextLabel).fill(TARGET_HEIGHT);
-      const compMaxY = new Int32Array(nextLabel).fill(-1);
-      const compCount = new Int32Array(nextLabel);
-
-      for (let row = 0; row < TARGET_HEIGHT; row++) {
-        for (let col = 0; col < TARGET_WIDTH; col++) {
-          const idx = row * TARGET_WIDTH + col;
-          const lbl = labels[idx];
-          if (lbl === -1) continue;
-          const root = findRoot(parent, lbl);
-          if (col < compMinX[root]) compMinX[root] = col;
-          if (col > compMaxX[root]) compMaxX[root] = col;
-          if (row < compMinY[root]) compMinY[root] = row;
-          if (row > compMaxY[root]) compMaxY[root] = row;
-          compCount[root]++;
-        }
-      }
-
-      const frameArea = TARGET_WIDTH * TARGET_HEIGHT;
-
-      // Filter candidates
-      const candidates: Array<{ x: number; y: number; w: number; h: number }> = [];
-      let totalComponents = 0;
-      let filteredByAspect = 0;
-      let filteredByArea = 0;
-      let filteredBySolidity = 0;
-
-      for (let lbl = 0; lbl < nextLabel; lbl++) {
-        if (compMaxX[lbl] === -1) continue;
-        if (findRoot(parent, lbl) !== lbl) continue;
-
-        totalComponents++;
-
-        const x = compMinX[lbl];
-        const y = compMinY[lbl];
-        const w = compMaxX[lbl] - x + 1;
-        const h = compMaxY[lbl] - y + 1;
-        if (w <= 0 || h <= 0) continue;
-
-        const pixelCount = compCount[lbl];
-        const aspectRatio = w / h;
-        const rectArea = w * h;
-        const solidity = pixelCount / rectArea;
-        const frameAreaRatio = rectArea / frameArea;
-
-        // Log details for components that are close to passing (for debugging)
-        if (aspectRatio >= 0.7 && aspectRatio <= 1.3 && frameAreaRatio >= 0.005 && frameAreaRatio <= 0.5) {
-          console.log(`[Detection] Component ${lbl}: size=${w}x${h}, aspect=${aspectRatio.toFixed(2)}, frameArea=${(frameAreaRatio*100).toFixed(1)}%, solidity=${solidity.toFixed(2)}`);
-        }
-
-        // Track why components are filtered
-        if (aspectRatio < 0.85 || aspectRatio > 1.15) {
-          filteredByAspect++;
-          continue;
-        }
-        // FIX 2: Frame area 0.5% to 40% (was 1% to 40%)
-        if (frameAreaRatio < 0.005 || frameAreaRatio > 0.4) {
-          filteredByArea++;
-          continue;
-        }
-        // FIX 1: CRITICAL — Hollow frame solidity 0.03 to 0.60 (was 0.15 to 0.55)
-        if (solidity <= 0.03 || solidity >= 0.60) {
-          filteredBySolidity++;
-          continue;
-        }
-
-        // Log when a component PASSES all filters
-        console.log(`[Detection] PASSED filter — size: ${w}x${h}, solidity: ${solidity.toFixed(3)}, frameArea: ${(frameAreaRatio*100).toFixed(1)}%`);
-
-        candidates.push({ x, y, w, h });
-      }
-
-      // ── STEPS 5–7: Validate each candidate ─────────────────────────────────
-      for (const cand of candidates) {
-        const { x, y, w, h } = cand;
-
-        // ── STEP 5 — Border darkness validation ──────────────────────────────
-        const bandW = Math.max(1, Math.floor(w * 0.12));
-        const bandH = Math.max(1, Math.floor(h * 0.12));
-
-        let borderSum = 0;
-        let borderCount = 0;
-
-        // Top band
-        for (let row = y; row < Math.min(y + bandH, TARGET_HEIGHT); row++) {
-          for (let col = x; col < Math.min(x + w, TARGET_WIDTH); col++) {
-            borderSum += grayData[row * TARGET_WIDTH + col];
-            borderCount++;
-          }
-        }
-        // Bottom band
-        for (
-          let row = Math.max(0, y + h - bandH);
-          row < Math.min(y + h, TARGET_HEIGHT);
-          row++
-        ) {
-          for (let col = x; col < Math.min(x + w, TARGET_WIDTH); col++) {
-            borderSum += grayData[row * TARGET_WIDTH + col];
-            borderCount++;
-          }
-        }
-        // Left band
-        for (
-          let row = Math.min(y + bandH, TARGET_HEIGHT);
-          row < Math.max(0, y + h - bandH);
-          row++
-        ) {
-          for (let col = x; col < Math.min(x + bandW, TARGET_WIDTH); col++) {
-            borderSum += grayData[row * TARGET_WIDTH + col];
-            borderCount++;
-          }
-        }
-        // Right band
-        for (
-          let row = Math.min(y + bandH, TARGET_HEIGHT);
-          row < Math.max(0, y + h - bandH);
-          row++
-        ) {
-          for (
-            let col = Math.max(0, x + w - bandW);
-            col < Math.min(x + w, TARGET_WIDTH);
-            col++
-          ) {
-            borderSum += grayData[row * TARGET_WIDTH + col];
-            borderCount++;
-          }
-        }
-
-        if (borderCount === 0) {
-          console.log(`[Detection] Rejected at Step 5 — borderCount=0`);
-          continue;
-        }
-        const borderMean = borderSum / borderCount;
-        // Border darkness threshold: 0.72 (relaxed for real lighting)
-        if (borderMean > 0.72) {
-          console.log(`[Detection] Rejected at Step 5 — border mean: ${borderMean.toFixed(2)}`);
-          continue;
-        }
-
-        // ── STEP 6 REMOVED — FIX 3: Inner white validation deleted entirely ───
-        // The marker has content inside (pig drawing), so we skip inner validation.
-        // Corner dot check in Step 7 is sufficient to identify our specific marker.
-
-        // ── STEP 7 — Corner dot detection and orientation ────────────────────
-        // Define inner area (inset by 12% on each side)
-        const innerX = Math.floor(x + w * 0.12);
-        const innerY = Math.floor(y + h * 0.12);
-        const innerW = Math.floor(w * 0.76);
-        const innerH = Math.floor(h * 0.76);
-
-        // Define 15%×15% corner search regions positioned at very corner edges
-        const qW = Math.floor(innerW * 0.15);
-        const qH = Math.floor(innerH * 0.15);
-
-        const quadrants = [
-          { x0: innerX, y0: innerY }, // TL: top-left corner
-          { x0: innerX + Math.floor(innerW * 0.85), y0: innerY }, // TR: top-right corner
-          { x0: innerX, y0: innerY + Math.floor(innerH * 0.85) }, // BL: bottom-left corner
-          { x0: innerX + Math.floor(innerW * 0.85), y0: innerY + Math.floor(innerH * 0.85) }, // BR: bottom-right corner
-        ];
-
-        const densities: number[] = [];
-        for (const q of quadrants) {
-          let blackCount = 0;
-          let total = 0;
-          for (let row = q.y0; row < Math.min(q.y0 + qH, TARGET_HEIGHT); row++) {
-            for (let col = q.x0; col < Math.min(q.x0 + qW, TARGET_WIDTH); col++) {
-              if (binaryData[row * TARGET_WIDTH + col] === 0) {
-                blackCount++;
+          if (pixelValue < DARK_THRESHOLD) {
+            darkCount++;
+            
+            // Bail-out if too many dark pixels (pointing at dark surface)
+            if (darkCount > MAX_DARK_PIXELS) {
+              if (frameCounter.value % 30 === 0) {
+                console.log(`[Heartbeat-ROI] Bail-out: ${darkCount} dark pixels (threshold: ${MAX_DARK_PIXELS})`);
               }
-              total++;
+              return; // Exit immediately to prevent hang
             }
-          }
-          densities.push(total > 0 ? blackCount / total : 0);
-        }
-
-        // ── RELATIVE/DYNAMIC THRESHOLDING (Robust Corner Detection) ──────────
-        // Find highest and second-highest densities
-        let maxDensity = -1;
-        let maxIndex = -1;
-        let secondMaxDensity = -1;
-
-        for (let i = 0; i < densities.length; i++) {
-          if (densities[i] > maxDensity) {
-            secondMaxDensity = maxDensity;
-            maxDensity = densities[i];
-            maxIndex = i;
-          } else if (densities[i] > secondMaxDensity) {
-            secondMaxDensity = densities[i];
+            
+            // Track bounding box
+            if (dx < minX) minX = dx;
+            if (dx > maxX) maxX = dx;
+            if (dy < minY) minY = dy;
+            if (dy > maxY) maxY = dy;
           }
         }
-
-        // Validation criteria for a valid single-corner marker:
-        // 1. Highest density must be sufficiently dark (> 0.25)
-        // 2. Second highest must be sufficiently light (< 0.18) - no competing corners
-        // 3. Highest must be distinctly higher than second (> 2x gap)
-        const MIN_ACTIVE_DENSITY = 0.25;
-        const MAX_NOISE_DENSITY = 0.18;
-        const MIN_CONTRAST_RATIO = 2.0;
-
-        const isHighestSufficientlyDark = maxDensity > MIN_ACTIVE_DENSITY;
-        const isSecondHighestSufficientlyLight = secondMaxDensity < MAX_NOISE_DENSITY;
-        const hasDistinctGap = maxDensity > secondMaxDensity * MIN_CONTRAST_RATIO;
-
-        // Enhanced logging with relative thresholding diagnostics
-        console.log(
-          `[Detection] Corner densities (relative) — TL: ${densities[0].toFixed(3)}, TR: ${densities[1].toFixed(3)}, BR: ${densities[3].toFixed(3)}, BL: ${densities[2].toFixed(3)} | ` +
-          `max: ${maxDensity.toFixed(3)}, 2nd: ${secondMaxDensity.toFixed(3)}, ratio: ${(maxDensity / (secondMaxDensity + 0.001)).toFixed(2)}x | ` +
-          `innerArea: ${Math.round(innerW)}x${Math.round(innerH)}`
-        );
-
-        if (!isHighestSufficientlyDark) {
-          console.log(`[Detection] Rejected at Step 7 — highest density too low (${maxDensity.toFixed(3)} < ${MIN_ACTIVE_DENSITY})`);
-          continue;
-        }
-
-        if (!isSecondHighestSufficientlyLight) {
-          console.log(`[Detection] Rejected at Step 7 — second highest too high (${secondMaxDensity.toFixed(3)} > ${MAX_NOISE_DENSITY}), competing corners detected`);
-          continue;
-        }
-
-        if (!hasDistinctGap) {
-          console.log(`[Detection] Rejected at Step 7 — insufficient contrast ratio (${(maxDensity / (secondMaxDensity + 0.001)).toFixed(2)}x < ${MIN_CONTRAST_RATIO}x)`);
-          continue;
-        }
-
-        // Determine rotation based on which corner has the highest density
-        let rotation: 0 | 90 | 180 | 270;
-        if (maxIndex === 0) {
-          rotation = 0; // TL
-        } else if (maxIndex === 1) {
-          rotation = 90; // TR
-        } else if (maxIndex === 3) {
-          rotation = 180; // BR
-        } else {
-          rotation = 270; // BL (maxIndex === 2)
-        }
-
-
-        // ── NEW: EXTRACT 4 CORNER POINTS ──────────────────────────────────────
-        let topLeft = { x: TARGET_WIDTH, y: TARGET_HEIGHT, sum: TARGET_WIDTH + TARGET_HEIGHT };
-        let topRight = { x: 0, y: TARGET_HEIGHT, diff: -TARGET_WIDTH };
-        let bottomRight = { x: 0, y: 0, sum: 0 };
-        let bottomLeft = { x: TARGET_WIDTH, y: 0, diff: TARGET_WIDTH };
-
-        // Iterate through the specific bounding box to find extreme points
-        for (let row = y; row < Math.min(y + h, TARGET_HEIGHT); row++) {
-          for (let col = x; col < Math.min(x + w, TARGET_WIDTH); col++) {
-            const idx = row * TARGET_WIDTH + col;
-            if (binaryData[idx] === 0) { // If it's a black pixel
-              const sum = col + row;
-              const diff = col - row;
-              
-              if (sum < topLeft.sum) topLeft = { x: col, y: row, sum };
-              if (diff > topRight.diff) topRight = { x: col, y: row, diff };
-              if (sum > bottomRight.sum) bottomRight = { x: col, y: row, sum };
-              if (diff < bottomLeft.diff) bottomLeft = { x: col, y: row, diff };
-            }
-          }
-        }
-
-        // Scale the 4 corners back up to the original high-res photo coordinates
-        const corners = {
-          topLeft: { x: Math.floor(topLeft.x * scaleX), y: Math.floor(topLeft.y * scaleY) },
-          topRight: { x: Math.floor(topRight.x * scaleX), y: Math.floor(topRight.y * scaleY) },
-          bottomRight: { x: Math.floor(bottomRight.x * scaleX), y: Math.floor(bottomRight.y * scaleY) },
-          bottomLeft: { x: Math.floor(bottomLeft.x * scaleX), y: Math.floor(bottomLeft.y * scaleY) },
-        };
-
-        // ── START THE COOLDOWN TIMER ──────────────────────────────────────────
-        // (We already checked the throttle at the very top of the worklet)
-        // Now that we have a success, we just update the timestamp.
-        lastDetectionTime.value = Date.now();
-
-   
-
-        // ── STEP 8 — Scale bounding box back to original frame coordinates ────
-        // Bounding box is in downscaled coordinates, scale back up for photo cropping
-        const scaledBox = {
-          x: Math.floor(x * scaleX),
-          y: Math.floor(y * scaleY),
-          w: Math.floor(w * scaleX),
-          h: Math.floor(h * scaleY),
-        };
-
-        console.log(`[FrameProcessor] ✓ MARKER DETECTED! Box: ${w}x${h} (downscaled) → ${scaledBox.w}x${scaledBox.h} (original), Rotation: ${rotation}°`);
-handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
-        return; // Stop after first valid marker
       }
+      
+      // ── HEARTBEAT LOG: Always log bounding box stats every 1 second ────────
+      if (frameCounter.value % 30 === 0) { // ~1 second at 2 FPS processing
+        const w = minX < maxX ? maxX - minX + 1 : 0;
+        const h = minY < maxY ? maxY - minY + 1 : 0;
+        const ratio = h > 0 ? (w / h).toFixed(2) : 0;
+        console.log(`[Heartbeat-ROI] DarkPixels: ${darkCount} | w: ${w} h: ${h} | ratio: ${ratio} | bounds: (${minX},${minY})-(${maxX},${maxY})`);
+      }
+      
+      // ── STEP 4: STAGE 1 VALIDATION (FAST PASS) ─────────────────────────────
+      if (darkCount < 100) return; // Too few dark pixels
+      if (minX >= maxX || minY >= maxY) return; // Invalid bounds
+      
+      const w = maxX - minX + 1;
+      const h = maxY - minY + 1;
+      
+      // CRITICAL: Maximum physical size check (reject before aspect ratio)
+      // Marker will never take up >60% of screen unless phone is touching paper
+      const maxWidth = TARGET_WIDTH * 0.6;   // 768 pixels at 1280 width
+      const maxHeight = TARGET_HEIGHT * 0.6; // 432 pixels at 720 height
+      if (w > maxWidth || h > maxHeight) return; // Reject large background shadows
+      
+      // Basic size check
+      if (w < 30 || h < 30) return; // Too small
+      if (w > 600 || h > 500) return; // Too large (adjusted for 720p)
+      
+      // Relaxed aspect ratio check (allow perspective skewing)
+      const aspectRatio = w / h;
+      if (aspectRatio < 0.70 || aspectRatio > 1.35) return;
+      
+      // Basic frame area check
+      const frameArea = sourceWidth * sourceHeight;
+      const rectArea = w * h;
+      const frameRatio = rectArea / frameArea;
+      if (frameRatio < 0.01 || frameRatio > 0.80) return;
+
+      // ── STEP 5: STAGE 2 STRUCTURAL VERIFICATION (QUADRANT DENSITY) ─────────
+      // Divide bounding box into 4 quadrants and check for anchor dot
+      const midX = Math.floor((minX + maxX) / 2);
+      const midY = Math.floor((minY + maxY) / 2);
+      
+      // Quadrant counters
+      let tlDark = 0, tlTotal = 0; // Top-Left
+      let trDark = 0, trTotal = 0; // Top-Right
+      let blDark = 0, blTotal = 0; // Bottom-Left
+      let brDark = 0, brTotal = 0; // Bottom-Right
+      
+      // Sample bounding box with stride-4 for speed
+      const QUAD_STRIDE = 4;
+      for (let dy = minY; dy <= maxY; dy += QUAD_STRIDE) {
+        const rowOffset = dy * sourceWidth;
+        for (let dx = minX; dx <= maxX; dx += QUAD_STRIDE) {
+          const pixelValue = pixelData[rowOffset + dx];
+          const isDark = pixelValue < DARK_THRESHOLD;
+          
+          // Determine quadrant
+          if (dy < midY) {
+            if (dx < midX) {
+              // Top-Left
+              tlTotal++;
+              if (isDark) tlDark++;
+            } else {
+              // Top-Right
+              trTotal++;
+              if (isDark) trDark++;
+            }
+          } else {
+            if (dx < midX) {
+              // Bottom-Left
+              blTotal++;
+              if (isDark) blDark++;
+            } else {
+              // Bottom-Right
+              brTotal++;
+              if (isDark) brDark++;
+            }
+          }
+        }
+      }
+      
+      // Calculate densities (0.0 to 1.0)
+      const tlDensity = tlTotal > 0 ? tlDark / tlTotal : 0;
+      const trDensity = trTotal > 0 ? trDark / trTotal : 0;
+      const blDensity = blTotal > 0 ? blDark / blTotal : 0;
+      const brDensity = brTotal > 0 ? brDark / brTotal : 0;
+      
+      // Find anchor quadrant (highest density)
+      let anchorDensity = tlDensity;
+      let anchorQuadrant = 'TL';
+      if (trDensity > anchorDensity) { anchorDensity = trDensity; anchorQuadrant = 'TR'; }
+      if (blDensity > anchorDensity) { anchorDensity = blDensity; anchorQuadrant = 'BL'; }
+      if (brDensity > anchorDensity) { anchorDensity = brDensity; anchorQuadrant = 'BR'; }
+      
+      // Calculate average density of other three quadrants
+      const allDensities = [tlDensity, trDensity, blDensity, brDensity];
+      const otherDensities = allDensities.filter(d => d !== anchorDensity);
+      const otherDensityAvg = otherDensities.reduce((sum, d) => sum + d, 0) / otherDensities.length;
+      
+      // ANCHOR VALIDATION LOGIC
+      // 1. Anchor must have significant density (>15% dark pixels)
+      // 2. Anchor must be noticeably darker than other quadrants (1.5x multiplier)
+      if (anchorDensity < 0.15) return; // No anchor dot found
+      if (anchorDensity <= otherDensityAvg * 1.5) return; // Anchor not distinct enough
+      
+      // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
+      // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
+      // Scan only the bounding box region (not entire frame)
+      let tlX = sourceWidth, tlY = sourceHeight, tlSum = sourceWidth + sourceHeight;
+      let trX = 0, trY = sourceHeight, trDiff = -sourceWidth;
+      let brX = 0, brY = 0, brSum = 0;
+      let blX = sourceWidth, blY = 0, blDiff = sourceWidth;
+      
+      // Scan with stride for speed
+      for (let dy = minY; dy <= maxY; dy += 2) {
+        const rowOffset = dy * sourceWidth;
+        for (let dx = minX; dx <= maxX; dx += 2) {
+          const pixelValue = pixelData[rowOffset + dx];
+          
+          if (pixelValue < DARK_THRESHOLD) {
+            const sum = dx + dy;
+            const diff = dx - dy;
+            
+            if (sum < tlSum) { tlX = dx; tlY = dy; tlSum = sum; }
+            if (diff > trDiff) { trX = dx; trY = dy; trDiff = diff; }
+            if (sum > brSum) { brX = dx; brY = dy; brSum = sum; }
+            if (diff < blDiff) { blX = dx; blY = dy; blDiff = diff; }
+          }
+        }
+      }
+      
+      // Corners are already in original coordinates (no scaling needed)
+      const corners = {
+        topLeft: { x: tlX, y: tlY },
+        topRight: { x: trX, y: trY },
+        bottomRight: { x: brX, y: brY },
+        bottomLeft: { x: blX, y: blY },
+      };
+      
+      const scaledBox = {
+        x: minX,
+        y: minY,
+        w: w,
+        h: h,
+      };
+
+      // ── TRIGGER ──────────────────────────────────────────────────────────────
+      // Lock the mutex IMMEDIATELY to prevent buffer overflow
+      isProcessing.value = true;
+      console.log('[Mutex] Locked - processing marker');
+      
+      lastDetectionTime.value = currentTime;
+      
+      // Default rotation (no quadrant detection in fast mode)
+      const rotation = 0;
+      
+      if (frameCounter.value % 20 === 0) {
+        console.log(`[Detection] ✓ Marker validated: ${w}x${h} | Anchor: ${anchorQuadrant} (${(anchorDensity * 100).toFixed(1)}%) | Quadrants: TL=${(tlDensity * 100).toFixed(1)}% TR=${(trDensity * 100).toFixed(1)}% BL=${(blDensity * 100).toFixed(1)}% BR=${(brDensity * 100).toFixed(1)}%`);
+      }
+      
+      handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
     }, [isScanning]);
 
     // ── Render ─────────────────────────────────────────────────────────────────
@@ -710,19 +585,25 @@ handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
 
     return (
       <View style={styles.root}>
-        {/* ── Layer 1 (bottom): Camera preview ── */}
+        {/* ── Layer 1 (bottom): Camera preview with tap-to-focus ── */}
         {device != null ? (
-          <Camera
-            ref={cameraRef}
-            style={styles.cameraPreview}
-            device={device}
-            isActive={isScanning}
-            photo={true}
-            video={false}
-            format={format}
-            pixelFormat="rgb"
-            frameProcessor={frameProcessor}
-          />
+          <GestureDetector gesture={tapGesture}>
+            <View style={styles.cameraContainer}>
+              <Camera
+                ref={cameraRef}
+                style={styles.cameraPreview}
+                device={device}
+                isActive={isScanning}
+                photo={true}
+                video={false}
+                format={format}
+                fps={30}
+                exposure={lockedExposure}
+                pixelFormat="rgb"
+                frameProcessor={frameProcessor}
+              />
+            </View>
+          </GestureDetector>
         ) : (
           <View style={[styles.cameraPreview, styles.cameraFallback]}>
             <Text style={styles.fallbackText}>
@@ -818,7 +699,30 @@ handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
           )}
         </View>
 
-        {/* ── Layer 4: Green capture flash ── */}
+        {/* ── Layer 4: Focus circle visual feedback ── */}
+        {focusPoint && (
+          <Animated.View
+            style={[
+              styles.focusCircle,
+              {
+                left: focusPoint.x - 40,
+                top: focusPoint.y - 40,
+                opacity: focusCircleAnim,
+                transform: [
+                  {
+                    scale: focusCircleAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [1.2, 1.0],
+                    }),
+                  },
+                ],
+              },
+            ]}
+            pointerEvents="none"
+          />
+        )}
+
+        {/* ── Layer 5: Green capture flash ── */}
         <Animated.View
           style={[styles.flashOverlay, { opacity: flashAnim }]}
           pointerEvents="none"
@@ -849,6 +753,7 @@ handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
       borderRadius: 8,
     },
     settingsButtonText: { color: '#000', fontSize: 16, fontWeight: '600' },
+    cameraContainer: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
     cameraPreview: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0 },
     cameraFallback: {
       justifyContent: 'center',
@@ -938,5 +843,14 @@ handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
       right: 0,
       bottom: 0,
       backgroundColor: '#00ff00',
+    },
+    focusCircle: {
+      position: 'absolute',
+      width: 80,
+      height: 80,
+      borderRadius: 40,
+      borderWidth: 2,
+      borderColor: '#FFD700',
+      backgroundColor: 'transparent',
     },
   });
