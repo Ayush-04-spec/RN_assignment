@@ -1,0 +1,348 @@
+// COPY THIS ENTIRE BLOCK TO REPLACE THE frameProcessor IN CameraScreen.tsx
+// Replace from line ~282 (const frameProcessor = useFrameProcessor) 
+// to line ~650 (}, [isScanning]);)
+
+const frameProcessor = useFrameProcessor((frame) => {
+  'worklet';
+  
+  // ── AGGRESSIVE THROTTLE: 250ms (4 FPS processing) ──────────────────────
+  const currentTime = Date.now();
+  
+  if (currentTime - lastProcessTime.value < 250) {
+    return;
+  }
+  lastProcessTime.value = currentTime;
+  
+  if (currentTime - lastDetectionTime.value < 1500) {
+    return;
+  }
+  
+  if (frameCounter.value === 0) {
+    console.log('[FrameProcessor] ✓ Zero-allocation optimized processor!');
+  }
+  
+  if (!isScanning) return;
+
+  frameCounter.value += 1;
+  if (frameCounter.value >= 600) {
+    frameCounter.value = 0;
+  }
+
+  const buffer = frame.toArrayBuffer();
+  const pixelData = new Uint8Array(buffer);
+  const sourceWidth = frame.width;
+  const sourceHeight = frame.height;
+  const scaleX = sourceWidth / TARGET_WIDTH;
+  const scaleY = sourceHeight / TARGET_HEIGHT;
+
+  // ── STEP 1: STRIDED DOWNSAMPLING (ZERO ALLOCATION) ────────────────────
+  let idx = 0;
+  for (let dy = 0; dy < TARGET_HEIGHT; dy++) {
+    const sourceY = Math.floor(dy * scaleY);
+    const rowOffset = sourceY * sourceWidth;
+    for (let dx = 0; dx < TARGET_WIDTH; dx++) {
+      const sourceX = Math.floor(dx * scaleX);
+      grayBuffer[idx++] = pixelData[rowOffset + sourceX];
+    }
+  }
+
+  // ── STEP 2: STRIDED SOBEL (every 4th pixel) ────────────────────────────
+  for (let i = 0; i < TOTAL_PIXELS; i++) {
+    edgeBuffer[i] = 0;
+  }
+  
+  const STRIDE = 4;
+  for (let y = STRIDE; y < TARGET_HEIGHT - STRIDE; y += STRIDE) {
+    const rowOffset = y * TARGET_WIDTH;
+    for (let x = STRIDE; x < TARGET_WIDTH - STRIDE; x += STRIDE) {
+      const idx = rowOffset + x;
+      const p00 = grayBuffer[idx - TARGET_WIDTH - 1];
+      const p01 = grayBuffer[idx - TARGET_WIDTH];
+      const p02 = grayBuffer[idx - TARGET_WIDTH + 1];
+      const p10 = grayBuffer[idx - 1];
+      const p12 = grayBuffer[idx + 1];
+      const p20 = grayBuffer[idx + TARGET_WIDTH - 1];
+      const p21 = grayBuffer[idx + TARGET_WIDTH];
+      const p22 = grayBuffer[idx + TARGET_WIDTH + 1];
+      
+      const gx = -p00 - (p01 << 1) - p02 + p20 + (p21 << 1) + p22;
+      const gy = -p00 - (p10 << 1) - p20 + p02 + (p12 << 1) + p22;
+      
+      const mag = (gx < 0 ? -gx : gx) + (gy < 0 ? -gy : gy);
+      edgeBuffer[idx] = mag > 255 ? 255 : mag;
+      
+      if (x + 1 < TARGET_WIDTH) edgeBuffer[idx + 1] = edgeBuffer[idx];
+      if (x + 2 < TARGET_WIDTH) edgeBuffer[idx + 2] = edgeBuffer[idx];
+      if (x + 3 < TARGET_WIDTH) edgeBuffer[idx + 3] = edgeBuffer[idx];
+    }
+  }
+
+  // ── STEP 3: FAST GLOBAL THRESHOLDING ───────────────────────────────────
+  let sum = 0;
+  for (let i = 0; i < TOTAL_PIXELS; i += 4) {
+    sum += edgeBuffer[i];
+  }
+  const globalMean = (sum * 4) / TOTAL_PIXELS;
+  const threshold = globalMean + 20;
+  
+  for (let i = 0; i < TOTAL_PIXELS; i++) {
+    binaryBuffer[i] = edgeBuffer[i] > threshold ? 0 : 1;
+  }
+
+  // ── STEP 4: FAST CCL ────────────────────────────────────────────────────
+  for (let i = 0; i < TOTAL_PIXELS; i++) {
+    labelBuffer[i] = -1;
+  }
+  for (let i = 0; i < parentBuffer.length; i++) {
+    parentBuffer[i] = i;
+  }
+  
+  let nextLabel = 0;
+  
+  const findRoot = (i: number): number => {
+    let root = i;
+    while (parentBuffer[root] !== root) {
+      root = parentBuffer[root];
+    }
+    let current = i;
+    while (current !== root) {
+      const next = parentBuffer[current];
+      parentBuffer[current] = root;
+      current = next;
+    }
+    return root;
+  };
+  
+  const union = (a: number, b: number): void => {
+    const ra = findRoot(a);
+    const rb = findRoot(b);
+    if (ra !== rb) {
+      parentBuffer[rb] = ra;
+    }
+  };
+
+  for (let row = 0; row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = 0; col < TARGET_WIDTH; col++) {
+      const idx = rowOffset + col;
+      if (binaryBuffer[idx] !== 0) continue;
+
+      const above = row > 0 ? labelBuffer[idx - TARGET_WIDTH] : -1;
+      const left = col > 0 ? labelBuffer[idx - 1] : -1;
+
+      if (above === -1 && left === -1) {
+        labelBuffer[idx] = nextLabel;
+        nextLabel++;
+      } else if (above !== -1 && left === -1) {
+        labelBuffer[idx] = above;
+      } else if (above === -1 && left !== -1) {
+        labelBuffer[idx] = left;
+      } else {
+        const ra = findRoot(above);
+        const rl = findRoot(left);
+        labelBuffer[idx] = ra < rl ? ra : rl;
+        if (ra !== rl) {
+          union(ra, rl);
+        }
+      }
+    }
+  }
+
+  // ── STEP 5: COLLECT STATS ───────────────────────────────────────────────
+  for (let i = 0; i < nextLabel; i++) {
+    const offset = i * 5;
+    compStatsBuffer[offset] = TARGET_WIDTH;
+    compStatsBuffer[offset + 1] = -1;
+    compStatsBuffer[offset + 2] = TARGET_HEIGHT;
+    compStatsBuffer[offset + 3] = -1;
+    compStatsBuffer[offset + 4] = 0;
+  }
+  
+  for (let row = 0; row < TARGET_HEIGHT; row++) {
+    for (let col = 0; col < TARGET_WIDTH; col++) {
+      const idx = row * TARGET_WIDTH + col;
+      const lbl = labelBuffer[idx];
+      if (lbl === -1) continue;
+      
+      const root = findRoot(lbl);
+      const offset = root * 5;
+      
+      if (col < compStatsBuffer[offset]) compStatsBuffer[offset] = col;
+      if (col > compStatsBuffer[offset + 1]) compStatsBuffer[offset + 1] = col;
+      if (row < compStatsBuffer[offset + 2]) compStatsBuffer[offset + 2] = row;
+      if (row > compStatsBuffer[offset + 3]) compStatsBuffer[offset + 3] = row;
+      compStatsBuffer[offset + 4]++;
+    }
+  }
+
+  // ── STEP 6: FAST FILTERING ──────────────────────────────────────────────
+  const frameArea = TOTAL_PIXELS;
+  const MIN_SIZE = 25;
+  const MAX_FRAME_RATIO = 0.80;
+  const MIN_FRAME_RATIO = 0.005;
+  
+  let bestCandidate = -1;
+  let bestScore = 0;
+  
+  for (let lbl = 0; lbl < nextLabel; lbl++) {
+    if (findRoot(lbl) !== lbl) continue;
+    
+    const offset = lbl * 5;
+    const minX = compStatsBuffer[offset];
+    const maxX = compStatsBuffer[offset + 1];
+    const minY = compStatsBuffer[offset + 2];
+    const maxY = compStatsBuffer[offset + 3];
+    
+    if (maxX === -1) continue;
+    
+    const w = maxX - minX + 1;
+    const h = maxY - minY + 1;
+    
+    if (w < MIN_SIZE || h < MIN_SIZE) continue;
+    
+    const aspectRatio = w / h;
+    if (aspectRatio < 0.6 || aspectRatio > 1.7) continue;
+    
+    const rectArea = w * h;
+    const frameRatio = rectArea / frameArea;
+    if (frameRatio < MIN_FRAME_RATIO || frameRatio > MAX_FRAME_RATIO) continue;
+    
+    const score = rectArea;
+    if (score > bestScore) {
+      bestScore = score;
+      bestCandidate = lbl;
+    }
+  }
+  
+  if (bestCandidate === -1) return;
+
+  // ── STEP 7: VALIDATE ─────────────────────────────────────────────────────
+  const offset = bestCandidate * 5;
+  const x = compStatsBuffer[offset];
+  const w = compStatsBuffer[offset + 1] - x + 1;
+  const y = compStatsBuffer[offset + 2];
+  const h = compStatsBuffer[offset + 3] - y + 1;
+  
+  const insetRatio = 0.12;
+  const innerX = Math.floor(x + w * insetRatio);
+  const innerY = Math.floor(y + h * insetRatio);
+  const innerW = Math.floor(w * (1 - 2 * insetRatio));
+  const innerH = Math.floor(h * (1 - 2 * insetRatio));
+  
+  if (innerW <= 0 || innerH <= 0) return;
+  
+  const qW = Math.floor(innerW / 2);
+  const qH = Math.floor(innerH / 2);
+  
+  let d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+  let t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+  
+  for (let row = innerY; row < innerY + qH && row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = innerX; col < innerX + qW && col < TARGET_WIDTH; col++) {
+      if (grayBuffer[rowOffset + col] < 128) d0++;
+      t0++;
+    }
+  }
+  
+  for (let row = innerY; row < innerY + qH && row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = innerX + qW; col < innerX + innerW && col < TARGET_WIDTH; col++) {
+      if (grayBuffer[rowOffset + col] < 128) d1++;
+      t1++;
+    }
+  }
+  
+  for (let row = innerY + qH; row < innerY + innerH && row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = innerX; col < innerX + qW && col < TARGET_WIDTH; col++) {
+      if (grayBuffer[rowOffset + col] < 128) d2++;
+      t2++;
+    }
+  }
+  
+  for (let row = innerY + qH; row < innerY + innerH && row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = innerX + qW; col < innerX + innerW && col < TARGET_WIDTH; col++) {
+      if (grayBuffer[rowOffset + col] < 128) d3++;
+      t3++;
+    }
+  }
+  
+  const dens0 = t0 > 0 ? d0 / t0 : 0;
+  const dens1 = t1 > 0 ? d1 / t1 : 0;
+  const dens2 = t2 > 0 ? d2 / t2 : 0;
+  const dens3 = t3 > 0 ? d3 / t3 : 0;
+  
+  let maxDens = dens0;
+  let maxIdx = 0;
+  if (dens1 > maxDens) { maxDens = dens1; maxIdx = 1; }
+  if (dens2 > maxDens) { maxDens = dens2; maxIdx = 2; }
+  if (dens3 > maxDens) { maxDens = dens3; maxIdx = 3; }
+  
+  let otherSum = 0;
+  let otherCount = 0;
+  if (maxIdx !== 0) { otherSum += dens0; otherCount++; }
+  if (maxIdx !== 1) { otherSum += dens1; otherCount++; }
+  if (maxIdx !== 2) { otherSum += dens2; otherCount++; }
+  if (maxIdx !== 3) { otherSum += dens3; otherCount++; }
+  const avgOther = otherCount > 0 ? otherSum / otherCount : 0;
+  
+  const MIN_ANCHOR = 0.15;
+  const MAX_OTHER = 0.20;
+  const MIN_CONTRAST = 1.5;
+  
+  if (maxDens < MIN_ANCHOR) return;
+  if (avgOther > MAX_OTHER) return;
+  if (maxDens < avgOther * MIN_CONTRAST) return;
+  
+  let rotation: 0 | 90 | 180 | 270;
+  if (maxIdx === 0) rotation = 0;
+  else if (maxIdx === 1) rotation = 90;
+  else if (maxIdx === 3) rotation = 180;
+  else rotation = 270;
+
+  // ── STEP 8: EXTRACT CORNERS ─────────────────────────────────────────────
+  let tlX = TARGET_WIDTH, tlY = TARGET_HEIGHT, tlSum = TARGET_WIDTH + TARGET_HEIGHT;
+  let trX = 0, trY = TARGET_HEIGHT, trDiff = -TARGET_WIDTH;
+  let brX = 0, brY = 0, brSum = 0;
+  let blX = TARGET_WIDTH, blY = 0, blDiff = TARGET_WIDTH;
+  
+  for (let row = y; row < y + h && row < TARGET_HEIGHT; row++) {
+    const rowOffset = row * TARGET_WIDTH;
+    for (let col = x; col < x + w && col < TARGET_WIDTH; col++) {
+      if (binaryBuffer[rowOffset + col] === 0) {
+        const sum = col + row;
+        const diff = col - row;
+        
+        if (sum < tlSum) { tlX = col; tlY = row; tlSum = sum; }
+        if (diff > trDiff) { trX = col; trY = row; trDiff = diff; }
+        if (sum > brSum) { brX = col; brY = row; brSum = sum; }
+        if (diff < blDiff) { blX = col; blY = row; blDiff = diff; }
+      }
+    }
+  }
+  
+  const corners = {
+    topLeft: { x: Math.floor(tlX * scaleX), y: Math.floor(tlY * scaleY) },
+    topRight: { x: Math.floor(trX * scaleX), y: Math.floor(trY * scaleY) },
+    bottomRight: { x: Math.floor(brX * scaleX), y: Math.floor(brY * scaleY) },
+    bottomLeft: { x: Math.floor(blX * scaleX), y: Math.floor(blY * scaleY) },
+  };
+  
+  const scaledBox = {
+    x: Math.floor(x * scaleX),
+    y: Math.floor(y * scaleY),
+    w: Math.floor(w * scaleX),
+    h: Math.floor(h * scaleY),
+  };
+
+  // ── TRIGGER ──────────────────────────────────────────────────────────────
+  lastDetectionTime.value = currentTime;
+  
+  if (frameCounter.value % 20 === 0) {
+    console.log(`[Detection] ✓ MARKER_1 at ${rotation}° (dens: [${dens0.toFixed(2)}, ${dens1.toFixed(2)}, ${dens2.toFixed(2)}, ${dens3.toFixed(2)}])`);
+  }
+  
+  handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
+}, [isScanning]);

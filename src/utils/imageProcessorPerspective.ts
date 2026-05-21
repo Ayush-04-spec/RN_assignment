@@ -1,5 +1,4 @@
 import { NativeModules } from 'react-native';
-import RNFS from 'react-native-fs';
 
 const { PerspectiveTransform } = NativeModules;
 
@@ -39,7 +38,7 @@ export async function extractAndProcessMarkerPerspective(
     // Ensure URI has file:// prefix
     const cleanUri = photoUri.startsWith('file://') ? photoUri : `file://${photoUri}`;
 
-    // Call native module to perform perspective transform
+    // Call native module to perform perspective transform with rotation
     const outputUri = await PerspectiveTransform.transformImage(
       cleanUri,
       corners,

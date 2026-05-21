@@ -12,6 +12,7 @@ import com.facebook.react.bridge.ReadableMap;
 
 import org.opencv.android.OpenCVLoader;
 import org.opencv.android.Utils;
+import org.opencv.core.Core;
 import org.opencv.core.CvType;
 import org.opencv.core.Mat;
 import org.opencv.core.MatOfPoint2f;
@@ -54,7 +55,7 @@ public class PerspectiveTransformModule extends ReactContextBaseJavaModule {
     }
 
     /**
-     * Performs 4-point perspective transform on an image.
+     * Performs 4-point perspective transform on an image with rotation correction.
      *
      * @param imageUri Source image URI from camera.takePhoto() (with file:// prefix)
      * @param corners  ReadableMap containing 4 corner points:
@@ -64,17 +65,19 @@ public class PerspectiveTransformModule extends ReactContextBaseJavaModule {
      *                   bottomRight: {x: number, y: number},
      *                   bottomLeft: {x: number, y: number}
      *                 }
+     * @param rotation Physical rotation of the marker in degrees (0, 90, 180, or 270)
      * @param promise  Promise to resolve with output URI or reject with error
      */
     @ReactMethod
-    public void transformImage(String imageUri, ReadableMap corners, Promise promise) {
+    public void transformImage(String imageUri, ReadableMap corners, double rotation, Promise promise) {
         long startTime = System.currentTimeMillis();
         Mat srcMat = null;
         Mat warpedMat = null;
+        Mat rotatedMat = null;
         Mat transformMatrix = null;
 
         try {
-            Log.d(TAG, "Starting perspective transform: " + imageUri);
+            Log.d(TAG, "Starting perspective transform: " + imageUri + ", rotation: " + rotation + "°");
 
             // ── STEP 1: Strip file:// prefix and load image ────────────────────
             String imagePath = imageUri.replace("file://", "");
@@ -173,33 +176,68 @@ public class PerspectiveTransformModule extends ReactContextBaseJavaModule {
 
             Log.d(TAG, "Applied perspective warp: " + warpedMat.cols() + "x" + warpedMat.rows());
 
-            // ── STEP 6: Save output to cache directory ────────────────────────
+            // ── STEP 6: Apply rotation correction ─────────────────────────────
+            // Map physical rotation (0, 90, 180, 270) to OpenCV rotation constants
+            Mat finalMat;
+            int rotationInt = (int) Math.round(rotation);
+            
+            if (rotationInt == 0) {
+                // No rotation needed
+                finalMat = warpedMat;
+                Log.d(TAG, "No rotation applied (0°)");
+            } else if (rotationInt == 90) {
+                // Rotate 90° clockwise
+                rotatedMat = new Mat();
+                Core.rotate(warpedMat, rotatedMat, Core.ROTATE_90_CLOCKWISE);
+                finalMat = rotatedMat;
+                Log.d(TAG, "Applied 90° clockwise rotation");
+            } else if (rotationInt == 180) {
+                // Rotate 180°
+                rotatedMat = new Mat();
+                Core.rotate(warpedMat, rotatedMat, Core.ROTATE_180);
+                finalMat = rotatedMat;
+                Log.d(TAG, "Applied 180° rotation");
+            } else if (rotationInt == 270) {
+                // Rotate 270° clockwise (= 90° counter-clockwise)
+                rotatedMat = new Mat();
+                Core.rotate(warpedMat, rotatedMat, Core.ROTATE_90_COUNTERCLOCKWISE);
+                finalMat = rotatedMat;
+                Log.d(TAG, "Applied 270° clockwise rotation");
+            } else {
+                Log.w(TAG, "Invalid rotation value: " + rotation + "°, defaulting to 0°");
+                finalMat = warpedMat;
+            }
+
+            // ── STEP 7: Save output to cache directory ────────────────────────
             File cacheDir = reactContext.getCacheDir();
             File outputFile = new File(cacheDir, "marker_" + System.currentTimeMillis() + ".jpg");
 
-            boolean success = Imgcodecs.imwrite(outputFile.getAbsolutePath(), warpedMat);
+            boolean success = Imgcodecs.imwrite(outputFile.getAbsolutePath(), finalMat);
             if (!success) {
                 promise.reject("SAVE_ERROR", "Failed to save warped image to: " + outputFile.getAbsolutePath());
                 return;
             }
 
-            // ── STEP 7: Return output URI with file:// prefix ─────────────────
+            // ── STEP 8: Return output URI with file:// prefix ─────────────────
             String outputUri = "file://" + outputFile.getAbsolutePath();
             long elapsed = System.currentTimeMillis() - startTime;
 
-            Log.d(TAG, "✓ Perspective transform complete: " + elapsed + "ms, saved to: " + outputUri);
+            Log.d(TAG, "✓ Perspective transform complete: " + elapsed + "ms, rotation: " + rotation + "°, saved to: " + outputUri);
             promise.resolve(outputUri);
 
         } catch (Exception e) {
             Log.e(TAG, "✗ Perspective transform failed", e);
             promise.reject("TRANSFORM_ERROR", "Perspective transform failed: " + e.getMessage(), e);
         } finally {
-            // ── STEP 8: Cleanup OpenCV matrices ───────────────────────────────
+            // ── STEP 9: Cleanup OpenCV matrices ───────────────────────────────
             if (srcMat != null) {
                 srcMat.release();
             }
-            if (warpedMat != null) {
+            if (warpedMat != null && warpedMat != rotatedMat) {
                 warpedMat.release();
+            }
+            if (rotatedMat != null) {
+                rotatedMat.release();
             }
             if (transformMatrix != null) {
                 transformMatrix.release();

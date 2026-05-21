@@ -1,0 +1,158 @@
+// ULTRA-FAST "DUMB AND FAST" FRAME PROCESSOR
+// Single-pass, stride-8, no complex math, <10ms execution
+// COPY THIS TO REPLACE THE ENTIRE frameProcessor IN CameraScreen.tsx
+
+const frameProcessor = useFrameProcessor((frame) => {
+  'worklet';
+  
+  // ── AGGRESSIVE THROTTLE: 500ms (2 FPS processing) ──────────────────────
+  const currentTime = Date.now();
+  
+  if (currentTime - lastProcessTime.value < 500) {
+    return;
+  }
+  lastProcessTime.value = currentTime;
+  
+  if (currentTime - lastDetectionTime.value < 1500) {
+    return;
+  }
+  
+  if (frameCounter.value === 0) {
+    console.log('[FrameProcessor] ✓ Ultra-fast single-pass processor!');
+  }
+  
+  if (!isScanning) return;
+
+  frameCounter.value += 1;
+  if (frameCounter.value >= 600) {
+    frameCounter.value = 0;
+  }
+
+  const buffer = frame.toArrayBuffer();
+  const pixelData = new Uint8Array(buffer);
+  const sourceWidth = frame.width;
+  const sourceHeight = frame.height;
+  const scaleX = sourceWidth / TARGET_WIDTH;
+  const scaleY = sourceHeight / TARGET_HEIGHT;
+
+  // ── STEP 1: ULTRA-FAST DOWNSAMPLING (stride 8) ─────────────────────────
+  // Only sample every 8th pixel (64x reduction)
+  const STRIDE = 8;
+  let idx = 0;
+  
+  for (let dy = 0; dy < TARGET_HEIGHT; dy += STRIDE) {
+    const sourceY = Math.floor(dy * scaleY);
+    const rowOffset = sourceY * sourceWidth;
+    for (let dx = 0; dx < TARGET_WIDTH; dx += STRIDE) {
+      const sourceX = Math.floor(dx * scaleX);
+      grayBuffer[idx++] = pixelData[rowOffset + sourceX];
+    }
+  }
+
+  // ── STEP 2: SINGLE-PASS BOUNDING BOX (NO NESTED LOOPS) ─────────────────
+  const DARK_THRESHOLD = 80; // Hardcoded threshold
+  const MAX_DARK_PIXELS = 50000; // Bail-out to prevent hang
+  
+  let minX = TARGET_WIDTH;
+  let maxX = 0;
+  let minY = TARGET_HEIGHT;
+  let maxY = 0;
+  let darkCount = 0;
+  
+  // Single pass through sampled pixels
+  idx = 0;
+  for (let dy = 0; dy < TARGET_HEIGHT; dy += STRIDE) {
+    for (let dx = 0; dx < TARGET_WIDTH; dx += STRIDE) {
+      const pixelValue = grayBuffer[idx++];
+      
+      if (pixelValue < DARK_THRESHOLD) {
+        darkCount++;
+        
+        // Bail-out if too many dark pixels (pointing at dark surface)
+        if (darkCount > MAX_DARK_PIXELS) {
+          return; // Exit immediately to prevent hang
+        }
+        
+        // Track bounding box
+        if (dx < minX) minX = dx;
+        if (dx > maxX) maxX = dx;
+        if (dy < minY) minY = dy;
+        if (dy > maxY) maxY = dy;
+      }
+    }
+  }
+  
+  // ── STEP 3: FAST VALIDATION (NO COMPLEX MATH) ──────────────────────────
+  if (darkCount < 100) return; // Too few dark pixels
+  if (minX >= maxX || minY >= maxY) return; // Invalid bounds
+  
+  const w = maxX - minX + 1;
+  const h = maxY - minY + 1;
+  
+  // Basic size check
+  if (w < 30 || h < 30) return; // Too small
+  if (w > 400 || h > 300) return; // Too large
+  
+  // Basic aspect ratio check (roughly square)
+  const aspectRatio = w / h;
+  if (aspectRatio < 0.75 || aspectRatio > 1.3) return;
+  
+  // Basic frame area check
+  const frameArea = TARGET_WIDTH * TARGET_HEIGHT;
+  const rectArea = w * h;
+  const frameRatio = rectArea / frameArea;
+  if (frameRatio < 0.01 || frameRatio > 0.80) return;
+
+  // ── STEP 4: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
+  // Scan only the bounding box region (not entire frame)
+  let tlX = TARGET_WIDTH, tlY = TARGET_HEIGHT, tlSum = TARGET_WIDTH + TARGET_HEIGHT;
+  let trX = 0, trY = TARGET_HEIGHT, trDiff = -TARGET_WIDTH;
+  let brX = 0, brY = 0, brSum = 0;
+  let blX = TARGET_WIDTH, blY = 0, blDiff = TARGET_WIDTH;
+  
+  // Scan with stride for speed
+  for (let dy = minY; dy <= maxY; dy += 2) {
+    const rowIdx = Math.floor(dy / STRIDE) * Math.floor(TARGET_WIDTH / STRIDE);
+    for (let dx = minX; dx <= maxX; dx += 2) {
+      const colIdx = Math.floor(dx / STRIDE);
+      const pixelValue = grayBuffer[rowIdx + colIdx];
+      
+      if (pixelValue < DARK_THRESHOLD) {
+        const sum = dx + dy;
+        const diff = dx - dy;
+        
+        if (sum < tlSum) { tlX = dx; tlY = dy; tlSum = sum; }
+        if (diff > trDiff) { trX = dx; trY = dy; trDiff = diff; }
+        if (sum > brSum) { brX = dx; brY = dy; brSum = sum; }
+        if (diff < blDiff) { blX = dx; blY = dy; blDiff = diff; }
+      }
+    }
+  }
+  
+  // Scale to original coordinates
+  const corners = {
+    topLeft: { x: Math.floor(tlX * scaleX), y: Math.floor(tlY * scaleY) },
+    topRight: { x: Math.floor(trX * scaleX), y: Math.floor(trY * scaleY) },
+    bottomRight: { x: Math.floor(brX * scaleX), y: Math.floor(brY * scaleY) },
+    bottomLeft: { x: Math.floor(blX * scaleX), y: Math.floor(blY * scaleY) },
+  };
+  
+  const scaledBox = {
+    x: Math.floor(minX * scaleX),
+    y: Math.floor(minY * scaleY),
+    w: Math.floor(w * scaleX),
+    h: Math.floor(h * scaleY),
+  };
+
+  // ── TRIGGER ──────────────────────────────────────────────────────────────
+  lastDetectionTime.value = currentTime;
+  
+  // Default rotation (no quadrant detection in fast mode)
+  const rotation = 0;
+  
+  if (frameCounter.value % 20 === 0) {
+    console.log(`[Detection] ✓ Fast detection: ${w}x${h} (${darkCount} dark pixels)`);
+  }
+  
+  handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
+}, [isScanning]);
