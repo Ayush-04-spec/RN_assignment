@@ -9,6 +9,7 @@
     TouchableOpacity,
     View,
   } from 'react-native';
+  import ReactNativeHapticFeedback from 'react-native-haptic-feedback';
   import { Worklets, useSharedValue } from 'react-native-worklets-core';
   import { Gesture, GestureDetector } from 'react-native-gesture-handler';
   import type { StackNavigationProp } from '@react-navigation/stack';
@@ -41,6 +42,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
     const lastDetectionTime = useSharedValue(0);
     const lastProcessTime = useSharedValue(0); // For 250ms throttle
     const isProcessing = useSharedValue(false); // Mutex lock to prevent buffer overflow
+    const lastStatus = useSharedValue<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING'); // Track status changes
 
     // ── State ──────────────────────────────────────────────────────────────────
     const [capturedCount, setCapturedCount] = useState<number>(0);
@@ -50,6 +52,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       x: number; y: number; w: number; h: number;
     } | null>(null);
     const [lockedExposure, setLockedExposure] = useState<number | undefined>(undefined);
+    const [status, setStatus] = useState<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING');
 
     // ── Refs ───────────────────────────────────────────────────────────────────
     const cameraRef = useRef<Camera>(null);
@@ -129,6 +132,81 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         pulseAnim.setValue(1);
       }
     }, [isScanning, pulseAnim]);
+
+    // ── Reticle animation (state-driven) ───────────────────────────────────────
+    const reticleScale = useRef(new Animated.Value(1)).current;
+    const reticleOpacity = useRef(new Animated.Value(1)).current;
+
+    useEffect(() => {
+      if (status === 'TRACKING') {
+        // Pulsing animation for TRACKING state
+        const pulseLoop = Animated.loop(
+          Animated.sequence([
+            Animated.timing(reticleScale, {
+              toValue: 1.05,
+              duration: 500,
+              useNativeDriver: true,
+            }),
+            Animated.timing(reticleScale, {
+              toValue: 1.0,
+              duration: 500,
+              useNativeDriver: true,
+            }),
+          ]),
+        );
+        pulseLoop.start();
+        return () => {
+          pulseLoop.stop();
+          reticleScale.setValue(1);
+        };
+      } else if (status === 'CAPTURED') {
+        // Flash animation for CAPTURED state
+        Animated.sequence([
+          Animated.timing(reticleOpacity, {
+            toValue: 0.3,
+            duration: 100,
+            useNativeDriver: true,
+          }),
+          Animated.timing(reticleOpacity, {
+            toValue: 1,
+            duration: 100,
+            useNativeDriver: true,
+          }),
+        ]).start();
+        reticleScale.setValue(1);
+      } else {
+        // SEARCHING state - reset
+        reticleScale.setValue(1);
+        reticleOpacity.setValue(1);
+      }
+    }, [status, reticleScale, reticleOpacity]);
+
+    // Get reticle color based on status
+    const getReticleColor = () => {
+      switch (status) {
+        case 'SEARCHING':
+          return '#ffffff';
+        case 'TRACKING':
+          return '#4A90E2'; // Blue
+        case 'CAPTURED':
+          return '#00FF00'; // Green
+        default:
+          return '#ffffff';
+      }
+    };
+
+    // ── Status update handler (JS thread) ──────────────────────────────────────
+    const handleStatusUpdate = useCallback((newStatus: 'SEARCHING' | 'TRACKING' | 'CAPTURED') => {
+      setStatus(newStatus);
+    }, []);
+
+    // ── Haptic feedback handler (JS thread) ────────────────────────────────────
+    const triggerHaptic = useCallback(() => {
+      ReactNativeHapticFeedback.trigger('impactHeavy', {
+        enableVibrateFallback: true,
+        ignoreAndroidSystemSettings: false,
+      });
+    }, []);
 
     // ── Tap-to-focus handler ───────────────────────────────────────────────────
     const handleTapToFocus = useCallback(async (x: number, y: number) => {
@@ -270,6 +348,8 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
 
     // ── Bridge: worklet → JS thread ────────────────────────────────────────────
     const handleMarkerDetectedJS = Worklets.createRunOnJS(handleMarkerDetected);
+    const handleStatusUpdateJS = Worklets.createRunOnJS(handleStatusUpdate);
+    const triggerHapticJS = Worklets.createRunOnJS(triggerHaptic);
 
     // ── Pre-allocated buffers for ZERO-ALLOCATION processing ───────────────────
     // CRITICAL: These dimensions MUST match the camera format (720p = 1280×720)
@@ -404,8 +484,23 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
       
       // ── STEP 4: STAGE 1 VALIDATION (FAST PASS) ─────────────────────────────
-      if (darkCount < 100) return; // Too few dark pixels
-      if (minX >= maxX || minY >= maxY) return; // Invalid bounds
+      if (darkCount < 100) {
+        // No marker found - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
+      
+      if (minX >= maxX || minY >= maxY) {
+        // Invalid bounds - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
       
       const w = maxX - minX + 1;
       const h = maxY - minY + 1;
@@ -414,21 +509,62 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       // Marker will never take up >60% of screen unless phone is touching paper
       const maxWidth = TARGET_WIDTH * 0.6;   // 768 pixels at 1280 width
       const maxHeight = TARGET_HEIGHT * 0.6; // 432 pixels at 720 height
-      if (w > maxWidth || h > maxHeight) return; // Reject large background shadows
+      if (w > maxWidth || h > maxHeight) {
+        // Too large - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
       
       // Basic size check
-      if (w < 30 || h < 30) return; // Too small
-      if (w > 600 || h > 500) return; // Too large (adjusted for 720p)
+      if (w < 30 || h < 30) {
+        // Too small - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
+      if (w > 600 || h > 500) {
+        // Too large - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
       
       // Relaxed aspect ratio check (allow perspective skewing)
       const aspectRatio = w / h;
-      if (aspectRatio < 0.70 || aspectRatio > 1.35) return;
+      if (aspectRatio < 0.70 || aspectRatio > 1.35) {
+        // Bad aspect ratio - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
       
       // Basic frame area check
       const frameArea = sourceWidth * sourceHeight;
       const rectArea = w * h;
       const frameRatio = rectArea / frameArea;
-      if (frameRatio < 0.01 || frameRatio > 0.80) return;
+      if (frameRatio < 0.01 || frameRatio > 0.80) {
+        // Bad frame ratio - update status to SEARCHING
+        if (lastStatus.value !== 'SEARCHING') {
+          lastStatus.value = 'SEARCHING';
+          handleStatusUpdateJS('SEARCHING');
+        }
+        return;
+      }
+      
+      // ── STAGE 1 PASSED: Square detected, update to TRACKING ────────────────
+      if (lastStatus.value !== 'TRACKING') {
+        lastStatus.value = 'TRACKING';
+        handleStatusUpdateJS('TRACKING');
+      }
 
       // ── STEP 5: STAGE 2 STRUCTURAL VERIFICATION (QUADRANT DENSITY) ─────────
       // Divide bounding box into 4 quadrants and check for anchor dot
@@ -495,8 +631,30 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       // ANCHOR VALIDATION LOGIC
       // 1. Anchor must have significant density (>15% dark pixels)
       // 2. Anchor must be noticeably darker than other quadrants (1.5x multiplier)
-      if (anchorDensity < 0.15) return; // No anchor dot found
-      if (anchorDensity <= otherDensityAvg * 1.5) return; // Anchor not distinct enough
+      if (anchorDensity < 0.15) {
+        // No anchor dot found - stay in TRACKING (Stage 1 passed but Stage 2 failed)
+        if (lastStatus.value !== 'TRACKING') {
+          lastStatus.value = 'TRACKING';
+          handleStatusUpdateJS('TRACKING');
+        }
+        return;
+      }
+      
+      if (anchorDensity <= otherDensityAvg * 1.5) {
+        // Anchor not distinct enough - stay in TRACKING
+        if (lastStatus.value !== 'TRACKING') {
+          lastStatus.value = 'TRACKING';
+          handleStatusUpdateJS('TRACKING');
+        }
+        return;
+      }
+      
+      // ── STAGE 2 PASSED: Valid marker with anchor dot detected! ─────────────
+      if (lastStatus.value !== 'CAPTURED') {
+        lastStatus.value = 'CAPTURED';
+        handleStatusUpdateJS('CAPTURED');
+        triggerHapticJS(); // Haptic feedback on successful detection
+      }
       
       // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
       // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
@@ -616,13 +774,22 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         <View style={styles.overlayTop} pointerEvents="none" />
         <View style={styles.overlayMiddleRow} pointerEvents="none">
           <View style={styles.overlaySide} />
-          <View style={styles.viewfinderBorder}>
+          <Animated.View 
+            style={[
+              styles.viewfinderBorder,
+              {
+                borderColor: getReticleColor(),
+                opacity: reticleOpacity,
+                transform: [{ scale: reticleScale }],
+              },
+            ]}
+          >
             <Animated.View
               style={[
                 styles.corner,
                 styles.cornerTopLeft,
                 {
-                  backgroundColor: cornerBorderColor,
+                  backgroundColor: getReticleColor(),
                   transform: [{ scale: cornerScale }],
                 },
               ]}
@@ -632,7 +799,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
                 styles.corner,
                 styles.cornerTopRight,
                 {
-                  backgroundColor: cornerBorderColor,
+                  backgroundColor: getReticleColor(),
                   transform: [{ scale: cornerScale }],
                 },
               ]}
@@ -642,7 +809,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
                 styles.corner,
                 styles.cornerBottomLeft,
                 {
-                  backgroundColor: cornerBorderColor,
+                  backgroundColor: getReticleColor(),
                   transform: [{ scale: cornerScale }],
                 },
               ]}
@@ -652,12 +819,12 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
                 styles.corner,
                 styles.cornerBottomRight,
                 {
-                  backgroundColor: cornerBorderColor,
+                  backgroundColor: getReticleColor(),
                   transform: [{ scale: cornerScale }],
                 },
               ]}
             />
-          </View>
+          </Animated.View>
           <View style={styles.overlaySide} />
         </View>
         <View style={styles.overlayBottom} pointerEvents="none" />
