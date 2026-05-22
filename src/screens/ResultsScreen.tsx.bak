@@ -24,17 +24,20 @@ const TOTAL_EXPECTED = 20;
 export const ResultsScreen = ({ route, navigation }: Props) => {
   const { images } = route.params;
 
+  // ── State ──────────────────────────────────────────────────────────────────
   const [verifiedImages, setVerifiedImages] = useState<(string | null)[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [displayCount, setDisplayCount] = useState<number>(0);
   const [showToast, setShowToast] = useState<boolean>(false);
 
+  // ── Animated Values ────────────────────────────────────────────────────────
   const countAnim = useRef(new Animated.Value(0)).current;
   const toastAnim = useRef(new Animated.Value(0)).current;
   const fadeAnims = useRef(
     Array.from({ length: 20 }, () => new Animated.Value(0)),
   ).current;
 
+  // ── Data Loading & Verification ────────────────────────────────────────────
   useEffect(() => {
     const verifyFiles = async () => {
       setIsLoading(true);
@@ -58,9 +61,11 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     verifyFiles();
   }, [images]);
 
+  // ── Counter Animation ──────────────────────────────────────────────────────
   useEffect(() => {
     if (isLoading) return;
 
+    // Animate counter from 0 to 20
     Animated.timing(countAnim, {
       toValue: 20,
       duration: 800,
@@ -76,6 +81,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     };
   }, [isLoading, countAnim]);
 
+  // ── Staggered Fade-In Animation ────────────────────────────────────────────
   useEffect(() => {
     if (isLoading) return;
 
@@ -89,7 +95,9 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     });
   }, [isLoading, fadeAnims]);
 
+  // ── Scan Again Handler ─────────────────────────────────────────────────────
   const handleScanAgain = async () => {
+    // Delete all saved marker files
     for (const path of images) {
       try {
         const cleanPath = path.replace('file://', '');
@@ -99,22 +107,27 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
       }
     }
 
+    // Reset navigation stack
     navigation.reset({
       index: 0,
       routes: [{ name: 'Camera' }],
     });
   };
 
+  // ── Save All Handler (Toast) ───────────────────────────────────────────────
   const handleSaveAll = () => {
     setShowToast(true);
 
     Animated.sequence([
+      // Fade in
       Animated.timing(toastAnim, {
         toValue: 1,
         duration: 200,
         useNativeDriver: true,
       }),
+      // Wait
       Animated.delay(1500),
+      // Fade out
       Animated.timing(toastAnim, {
         toValue: 0,
         duration: 200,
@@ -125,6 +138,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     });
   };
 
+  // ── Render Item ────────────────────────────────────────────────────────────
   const renderItem = ({
     item,
     index,
@@ -152,6 +166,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     );
   };
 
+  // ── Loading State ──────────────────────────────────────────────────────────
   if (isLoading) {
     return (
       <SafeAreaView style={styles.root}>
@@ -163,10 +178,12 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
     );
   }
 
+  // ── Main UI ────────────────────────────────────────────────────────────────
   const validCount = verifiedImages.filter(Boolean).length;
 
   return (
     <SafeAreaView style={styles.root}>
+      {/* Header */}
       <Text style={styles.header}>
         Captured Markers ({displayCount}/{TOTAL_EXPECTED})
       </Text>
@@ -174,6 +191,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
         Captured: {validCount} of {TOTAL_EXPECTED}
       </Text>
 
+      {/* Image Grid */}
       <FlatList
         data={verifiedImages}
         keyExtractor={(_, index) => index.toString()}
@@ -183,6 +201,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
         style={styles.grid}
       />
 
+      {/* Bottom Actions */}
       <View style={styles.actionsContainer}>
         <TouchableOpacity
           style={styles.scanAgainButton}
@@ -195,6 +214,7 @@ export const ResultsScreen = ({ route, navigation }: Props) => {
         </TouchableOpacity>
       </View>
 
+      {/* Toast Message */}
       {showToast && (
         <Animated.View
           style={[styles.toastContainer, { opacity: toastAnim }]}>
@@ -211,6 +231,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#fff',
   },
 
+  // ── Loading ─────────────────────────────────────────────────────────────────
   loadingContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -222,6 +243,7 @@ const styles = StyleSheet.create({
     color: '#666',
   },
 
+  // ── Header ──────────────────────────────────────────────────────────────────
   header: {
     fontSize: 20,
     fontWeight: 'bold',
@@ -237,6 +259,7 @@ const styles = StyleSheet.create({
     marginBottom: 16,
   },
 
+  // ── Grid ────────────────────────────────────────────────────────────────────
   grid: {
     flex: 1,
   },
@@ -255,6 +278,7 @@ const styles = StyleSheet.create({
     height: 300,
   },
 
+  // ── Placeholder ─────────────────────────────────────────────────────────────
   placeholder: {
     flex: 1,
     backgroundColor: '#cccccc',
@@ -267,6 +291,7 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
   },
 
+  // ── Actions ─────────────────────────────────────────────────────────────────
   actionsContainer: {
     position: 'absolute',
     bottom: 0,
@@ -306,6 +331,7 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
+  // ── Toast ───────────────────────────────────────────────────────────────────
   toastContainer: {
     position: 'absolute',
     bottom: 180,

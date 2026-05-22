@@ -9,7 +9,15 @@ type Corners = {
   bottomLeft: { x: number; y: number };
 };
 
-/** Extracts a marker from a high-resolution photo using 4-point perspective transform. */
+/**
+ * Extracts a marker from a high-resolution photo using 4-point perspective transform.
+ * This produces a perfectly flat, tightly cropped 300×300px image with zero geometric skew.
+ *
+ * @param photoUri - Full-resolution photo URI from camera.takePhoto()
+ * @param corners - 4 corner coordinates of the marker in photo coordinates
+ * @param rotation - Detected marker rotation (0, 90, 180, or 270)
+ * @returns File path with 'file://' prefix, or null on error
+ */
 export async function extractAndProcessMarkerPerspective(
   photoUri: string,
   corners: Corners,
@@ -27,8 +35,10 @@ export async function extractAndProcessMarkerPerspective(
       `BL(${corners.bottomLeft.x.toFixed(0)},${corners.bottomLeft.y.toFixed(0)})`
     );
 
+    // Ensure URI has file:// prefix
     const cleanUri = photoUri.startsWith('file://') ? photoUri : `file://${photoUri}`;
 
+    // Call native module to perform perspective transform with rotation
     const outputUri = await PerspectiveTransform.transformImage(
       cleanUri,
       corners,
@@ -51,11 +61,16 @@ export async function extractAndProcessMarkerPerspective(
   }
 }
 
+/**
+ * Fallback: If perspective transform fails, use the old bounding box method.
+ * This is kept for backwards compatibility.
+ */
 export async function extractAndProcessMarkerFallback(
   photoUri: string,
   boundingBox: { x: number; y: number; w: number; h: number },
   rotation: 0 | 90 | 180 | 270,
 ): Promise<string | null> {
+  // Import the old implementation
   const { extractAndProcessMarker } = require('./imageProcessor');
   return extractAndProcessMarker(photoUri, boundingBox, rotation);
 }

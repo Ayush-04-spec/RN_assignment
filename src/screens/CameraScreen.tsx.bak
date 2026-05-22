@@ -35,14 +35,17 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
   const BOTTOM_BAR_HEIGHT = 120;
 
   export const CameraScreen = () => {
+    // ── Navigation ─────────────────────────────────────────────────────────────
     const navigation = useNavigation<StackNavigationProp<RootStackParamList, 'Camera'>>();
 
+    // ── Shared Values ──────────────────────────────────────────────────────────
     const frameCounter = useSharedValue(0);
     const lastDetectionTime = useSharedValue(0);
     const lastProcessTime = useSharedValue(0); // For 250ms throttle
     const isProcessing = useSharedValue(false); // Mutex lock to prevent buffer overflow
-    const lastStatus = useSharedValue<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING');
+    const lastStatus = useSharedValue<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING'); // Track status changes
 
+    // ── State ──────────────────────────────────────────────────────────────────
     const [capturedCount, setCapturedCount] = useState<number>(0);
     const [isScanning, setIsScanning] = useState<boolean>(true);
     const [capturedImages, setCapturedImages] = useState<string[]>([]);
@@ -52,17 +55,21 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
     const [lockedExposure, setLockedExposure] = useState<number | undefined>(undefined);
     const [status, setStatus] = useState<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING');
 
+    // ── Refs ───────────────────────────────────────────────────────────────────
     const cameraRef = useRef<Camera>(null);
     const capturedImagesRef = useRef<string[]>(capturedImages);
     const previousStatus = useRef<'SEARCHING' | 'TRACKING' | 'CAPTURED'>('SEARCHING');
     
+    // ── Focus circle state ─────────────────────────────────────────────────────
     const [focusPoint, setFocusPoint] = useState<{ x: number; y: number } | null>(null);
     const focusCircleAnim = useRef(new Animated.Value(0)).current;
     
+
     useEffect(() => {
       capturedImagesRef.current = capturedImages;
     }, [capturedImages]);
 
+    // ── Haptic feedback configuration ──────────────────────────────────────────
     const hapticOptions = {
       enableVibrateFallback: true,
       ignoreAndroidSystemSettings: false, // Respect system for light taps
@@ -73,36 +80,45 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       ignoreAndroidSystemSettings: true, // Override system for success feedback
     };
 
+    // ── Haptic state machine (edge-triggered) ──────────────────────────────────
     useEffect(() => {
+      // SEARCHING → TRACKING: "Lock-On" tap (light impact)
       if (status === 'TRACKING' && previousStatus.current === 'SEARCHING') {
         ReactNativeHapticFeedback.trigger('impactLight', hapticOptions);
         console.log('[Haptic] Lock-On (SEARCHING → TRACKING)');
       }
 
+      // TRACKING → CAPTURED: "Action" pulse (strong success pattern)
       if (status === 'CAPTURED' && previousStatus.current === 'TRACKING') {
         // Use notificationSuccess for a more distinct, punchy pattern
         ReactNativeHapticFeedback.trigger('notificationSuccess', hapticOptionsStrong);
         console.log('[Haptic] Success (TRACKING → CAPTURED) - Strong pattern');
         
+        // Add a second pulse after 100ms for double-tap effect
         setTimeout(() => {
           ReactNativeHapticFeedback.trigger('impactHeavy', hapticOptionsStrong);
           console.log('[Haptic] Success double-pulse');
         }, 100);
       }
 
+      // Update previous status for next comparison
       previousStatus.current = status;
     }, [status]);
 
+    // ── Keep screen awake during batch scanning ────────────────────────────────
     useEffect(() => {
+      // Activate keep awake when component mounts
       activateKeepAwake();
       console.log('[KeepAwake] Screen sleep prevention activated');
 
+      // Deactivate keep awake when component unmounts
       return () => {
         deactivateKeepAwake();
         console.log('[KeepAwake] Screen sleep prevention deactivated');
       };
     }, []);
 
+    // ── Flash animation ────────────────────────────────────────────────────────
     const flashAnim = useRef(new Animated.Value(0)).current;
 
     const triggerCaptureFlash = useCallback(() => {
@@ -120,6 +136,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       ]).start();
     }, [flashAnim]);
 
+    // ── Corner animation ───────────────────────────────────────────────────────
     const cornerAnim = useRef(new Animated.Value(0)).current;
 
     const triggerCornerAnimation = useCallback(() => {
@@ -137,6 +154,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       ]).start();
     }, [cornerAnim]);
 
+    // ── Status text pulse animation ────────────────────────────────────────────
     const pulseAnim = useRef(new Animated.Value(1)).current;
 
     useEffect(() => {
@@ -166,11 +184,13 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
     }, [isScanning, pulseAnim]);
 
+    // ── Reticle animation (state-driven) ───────────────────────────────────────
     const reticleScale = useRef(new Animated.Value(1)).current;
     const reticleOpacity = useRef(new Animated.Value(1)).current;
 
     useEffect(() => {
       if (status === 'TRACKING') {
+        // Pulsing animation for TRACKING state
         const pulseLoop = Animated.loop(
           Animated.sequence([
             Animated.timing(reticleScale, {
@@ -191,6 +211,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           reticleScale.setValue(1);
         };
       } else if (status === 'CAPTURED') {
+        // Flash animation for CAPTURED state
         Animated.sequence([
           Animated.timing(reticleOpacity, {
             toValue: 0.3,
@@ -205,37 +226,43 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         ]).start();
         reticleScale.setValue(1);
       } else {
+        // SEARCHING state - reset
         reticleScale.setValue(1);
         reticleOpacity.setValue(1);
       }
     }, [status, reticleScale, reticleOpacity]);
 
+    // Get reticle color based on status
     const getReticleColor = () => {
       switch (status) {
         case 'SEARCHING':
           return '#ffffff';
         case 'TRACKING':
-          return '#4A90E2';
+          return '#4A90E2'; // Blue
         case 'CAPTURED':
-          return '#00FF00';
+          return '#00FF00'; // Green
         default:
           return '#ffffff';
       }
     };
 
+    // ── Status update handler (JS thread) ──────────────────────────────────────
     const handleStatusUpdate = useCallback((newStatus: 'SEARCHING' | 'TRACKING' | 'CAPTURED') => {
       setStatus(newStatus);
     }, []);
 
+    // ── Tap-to-focus handler ───────────────────────────────────────────────────
     const handleTapToFocus = useCallback(async (x: number, y: number) => {
       if (!cameraRef.current) return;
 
       try {
+        // Set focus point for visual feedback
         setFocusPoint({ x, y });
 
         // Lock exposure to stop hunting
         setLockedExposure(0);
 
+        // Trigger focus circle animation
         focusCircleAnim.setValue(0);
         Animated.sequence([
           Animated.timing(focusCircleAnim, {
@@ -249,9 +276,11 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
             useNativeDriver: true,
           }),
         ]).start(() => {
+          // Clear focus point after animation
           setFocusPoint(null);
         });
 
+        // Focus camera at tapped point with exposure lock
         await cameraRef.current.focus({ x, y });
         console.log(`[CameraScreen] Focused at (${x.toFixed(0)}, ${y.toFixed(0)})`);
       } catch (error) {
@@ -259,17 +288,20 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
     }, [focusCircleAnim]);
 
+    // ── Gesture detector for tap-to-focus ──────────────────────────────────────
     const tapGesture = Gesture.Tap()
       .onEnd((event) => {
         handleTapToFocus(event.x, event.y);
       });
 
+    // ── Camera permission ──────────────────────────────────────────────────────
     const { hasPermission, requestPermission } = useCameraPermission();
 
     useEffect(() => {
       requestPermission();
     }, []);
 
+    // ── Camera device & format ─────────────────────────────────────────────────
     const device = useCameraDevice('back');
     
     // CRITICAL: Force 720p video resolution to prevent 12MP overload
@@ -292,6 +324,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       );
     }, [format]);
 
+// ── Marker detection handler (JS thread) ──────────────────────────────────
     const handleMarkerDetected = useCallback(
       async (
         boundingBox: DetectionResult['boundingBox'],
@@ -301,18 +334,23 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         frameHeight: number,
       ) => {
         
+        // 1. Check if already processing (should be locked by worklet, but double-check)
         if (!boundingBox || rotation === null) {
           return;
         }
 
+        // 2. TRIGGER THE VISUAL FEEDBACK IMMEDIATELY
+        // This tells the user "I saw it!" before the heavy processing even starts
         triggerCaptureFlash();
         triggerCornerAnimation();
 
         if (!cameraRef.current) {
+          // Unlock on error
           isProcessing.value = false;
           return;
         }
 
+        // 3. Take Photo and Process
         try {
           const photo = await cameraRef.current.takePhoto();
           const photoUri = photo.path.startsWith('file://') ? photo.path : `file://${photo.path}`;
@@ -334,12 +372,14 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
               }
               return next;
             });
+            // Update the counter on the screen
             setCapturedCount(prev => Math.min(prev + 1, 20));
             console.log(`[State] Captured marker ${capturedCount + 1}/20`);
           }
         } catch (error) {
           console.error('[CameraScreen] processing failed:', error);
         } finally {
+          // Unlock after 1.5 seconds cooldown (gives user time to move to next marker)
           setTimeout(() => {
             isProcessing.value = false;
             console.log('[Mutex] Unlocked - ready for next marker');
@@ -349,14 +389,16 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       [triggerCaptureFlash, triggerCornerAnimation, navigation, isProcessing, capturedCount],
     );
 
+    // ── Bridge: worklet → JS thread ────────────────────────────────────────────
     const handleMarkerDetectedJS = Worklets.createRunOnJS(handleMarkerDetected);
     const handleStatusUpdateJS = Worklets.createRunOnJS(handleStatusUpdate);
 
+    // ── Pre-allocated buffers for ZERO-ALLOCATION processing ───────────────────
     // CRITICAL: These dimensions MUST match the camera format (720p = 1280×720)
     // If camera is in portrait, dimensions may be swapped (720×1280)
     const TARGET_WIDTH = 1280;
     const TARGET_HEIGHT = 720;
-    const TOTAL_PIXELS = TARGET_WIDTH * TARGET_HEIGHT;
+    const TOTAL_PIXELS = TARGET_WIDTH * TARGET_HEIGHT; // 921,600 pixels
     
     const grayBuffer = useRef(new Uint8Array(TOTAL_PIXELS)).current;
     const edgeBuffer = useRef(new Uint8Array(TOTAL_PIXELS)).current;
@@ -365,14 +407,18 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
     const parentBuffer = useRef(new Int32Array(TOTAL_PIXELS * 2)).current;
     const compStatsBuffer = useRef(new Int32Array(TOTAL_PIXELS * 5)).current;
 
+    // ── Frame processor with ULTRA-FAST single-pass detection ──────────────────
+    // DIRECT PROCESSING: 1280×720 (no downscaling needed)
     const frameProcessor = useFrameProcessor((frame) => {
       'worklet';
       
+      // ── MUTEX LOCK: Instantly drop frames if processing ────────────────────
       // This prevents CameraX buffer overflow (maxImages: 6)
       if (isProcessing.value) {
-        return;
+        return; // Drop frame immediately (0.001ms) to prevent buffer pile-up
       }
       
+      // ── FAILSAFE: Check frame size matches our buffers ─────────────────────
       const framePixels = frame.width * frame.height;
       if (framePixels > TOTAL_PIXELS) {
         if (frameCounter.value === 0) {
@@ -382,6 +428,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       
+      // ── AGGRESSIVE THROTTLE: 500ms (2 FPS processing) ──────────────────────
       const currentTime = Date.now();
       
       if (currentTime - lastProcessTime.value < 500) {
@@ -409,14 +456,17 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       const sourceWidth = frame.width;
       const sourceHeight = frame.height;
 
+      // ── STEP 1: DEFINE STRICT 400x400 CENTER ROI ───────────────────────────
       const ROI_SIZE = 400;
       const centerX = Math.floor(TARGET_WIDTH / 2);
       const centerY = Math.floor(TARGET_HEIGHT / 2);
-      const startX = centerX - 200;
-      const endX = centerX + 200;
-      const startY = centerY - 200;
-      const endY = centerY + 200;
+      const startX = centerX - 200; // 440 at 1280 width
+      const endX = centerX + 200;   // 840 at 1280 width
+      const startY = centerY - 200; // 160 at 720 height
+      const endY = centerY + 200;   // 560 at 720 height
       
+      // ── STEP 2: ULTRA-FAST DOWNSAMPLING (stride 8, ROI only) ───────────────
+      // Only sample every 8th pixel within the 400x400 center ROI
       const STRIDE = 8;
       let idx = 0;
       
@@ -429,6 +479,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         }
       }
 
+      // ── STEP 3: SINGLE-PASS BOUNDING BOX (ROI only) ────────────────────────
       const DARK_THRESHOLD = 50; // STRICT: Only pure black ink
       const MAX_DARK_PIXELS = 50000; // Bail-out to prevent hang
       
@@ -438,6 +489,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       let maxY = 0;
       let darkCount = 0;
       
+      // Single pass through sampled pixels (ROI only)
       idx = 0;
       for (let dy = startY; dy < endY; dy += STRIDE) {
         for (let dx = startX; dx < endX; dx += STRIDE) {
@@ -456,6 +508,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
               return; // Exit immediately to prevent hang
             }
             
+            // Track bounding box
             if (dx < minX) minX = dx;
             if (dx > maxX) maxX = dx;
             if (dy < minY) minY = dy;
@@ -464,14 +517,17 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         }
       }
       
-      if (frameCounter.value % 30 === 0) {
+      // ── HEARTBEAT LOG: Always log bounding box stats every 1 second ────────
+      if (frameCounter.value % 30 === 0) { // ~1 second at 2 FPS processing
         const w = minX < maxX ? maxX - minX + 1 : 0;
         const h = minY < maxY ? maxY - minY + 1 : 0;
         const ratio = h > 0 ? (w / h).toFixed(2) : 0;
         console.log(`[Heartbeat-ROI] DarkPixels: ${darkCount} | w: ${w} h: ${h} | ratio: ${ratio} | bounds: (${minX},${minY})-(${maxX},${maxY})`);
       }
       
+      // ── STEP 4: STAGE 1 VALIDATION (FAST PASS) ─────────────────────────────
       if (darkCount < 100) {
+        // No marker found - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -480,6 +536,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
       
       if (minX >= maxX || minY >= maxY) {
+        // Invalid bounds - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -492,9 +549,10 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       
       // CRITICAL: Maximum physical size check (reject before aspect ratio)
       // Marker will never take up >60% of screen unless phone is touching paper
-      const maxWidth = TARGET_WIDTH * 0.6;
-      const maxHeight = TARGET_HEIGHT * 0.6;
+      const maxWidth = TARGET_WIDTH * 0.6;   // 768 pixels at 1280 width
+      const maxHeight = TARGET_HEIGHT * 0.6; // 432 pixels at 720 height
       if (w > maxWidth || h > maxHeight) {
+        // Too large - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -502,7 +560,9 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       
+      // Basic size check
       if (w < 30 || h < 30) {
+        // Too small - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -510,6 +570,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       if (w > 600 || h > 500) {
+        // Too large - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -520,6 +581,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       // Relaxed aspect ratio check (allow perspective skewing)
       const aspectRatio = w / h;
       if (aspectRatio < 0.70 || aspectRatio > 1.35) {
+        // Bad aspect ratio - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -527,10 +589,12 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       
+      // Basic frame area check
       const frameArea = sourceWidth * sourceHeight;
       const rectArea = w * h;
       const frameRatio = rectArea / frameArea;
       if (frameRatio < 0.01 || frameRatio > 0.80) {
+        // Bad frame ratio - update status to SEARCHING
         if (lastStatus.value !== 'SEARCHING') {
           lastStatus.value = 'SEARCHING';
           handleStatusUpdateJS('SEARCHING');
@@ -538,20 +602,26 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       
+      // ── STAGE 1 PASSED: Square detected, update to TRACKING ────────────────
+      // Update status to TRACKING if not already
       const wasTracking = lastStatus.value === 'TRACKING';
       if (!wasTracking) {
         lastStatus.value = 'TRACKING';
         handleStatusUpdateJS('TRACKING');
       }
 
+      // ── STEP 5: STAGE 2 STRUCTURAL VERIFICATION (QUADRANT DENSITY) ─────────
+      // Divide bounding box into 4 quadrants and check for anchor dot
       const midX = Math.floor((minX + maxX) / 2);
       const midY = Math.floor((minY + maxY) / 2);
       
-      let tlDark = 0, tlTotal = 0;
-      let trDark = 0, trTotal = 0;
-      let blDark = 0, blTotal = 0;
-      let brDark = 0, brTotal = 0;
+      // Quadrant counters
+      let tlDark = 0, tlTotal = 0; // Top-Left
+      let trDark = 0, trTotal = 0; // Top-Right
+      let blDark = 0, blTotal = 0; // Bottom-Left
+      let brDark = 0, brTotal = 0; // Bottom-Right
       
+      // Sample bounding box with stride-4 for speed
       const QUAD_STRIDE = 4;
       for (let dy = minY; dy <= maxY; dy += QUAD_STRIDE) {
         const rowOffset = dy * sourceWidth;
@@ -559,19 +629,24 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           const pixelValue = pixelData[rowOffset + dx];
           const isDark = pixelValue < DARK_THRESHOLD;
           
+          // Determine quadrant
           if (dy < midY) {
             if (dx < midX) {
+              // Top-Left
               tlTotal++;
               if (isDark) tlDark++;
             } else {
+              // Top-Right
               trTotal++;
               if (isDark) trDark++;
             }
           } else {
             if (dx < midX) {
+              // Bottom-Left
               blTotal++;
               if (isDark) blDark++;
             } else {
+              // Bottom-Right
               brTotal++;
               if (isDark) brDark++;
             }
@@ -579,22 +654,29 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         }
       }
       
+      // Calculate densities (0.0 to 1.0)
       const tlDensity = tlTotal > 0 ? tlDark / tlTotal : 0;
       const trDensity = trTotal > 0 ? trDark / trTotal : 0;
       const blDensity = blTotal > 0 ? blDark / blTotal : 0;
       const brDensity = brTotal > 0 ? brDark / brTotal : 0;
       
+      // Find anchor quadrant (highest density)
       let anchorDensity = tlDensity;
       let anchorQuadrant = 'TL';
       if (trDensity > anchorDensity) { anchorDensity = trDensity; anchorQuadrant = 'TR'; }
       if (blDensity > anchorDensity) { anchorDensity = blDensity; anchorQuadrant = 'BL'; }
       if (brDensity > anchorDensity) { anchorDensity = brDensity; anchorQuadrant = 'BR'; }
       
+      // Calculate average density of other three quadrants
       const allDensities = [tlDensity, trDensity, blDensity, brDensity];
       const otherDensities = allDensities.filter(d => d !== anchorDensity);
       const otherDensityAvg = otherDensities.reduce((sum, d) => sum + d, 0) / otherDensities.length;
       
+      // ANCHOR VALIDATION LOGIC
+      // 1. Anchor must have significant density (>15% dark pixels)
+      // 2. Anchor must be noticeably darker than other quadrants (1.5x multiplier)
       if (anchorDensity < 0.15) {
+        // No anchor dot found - stay in TRACKING (Stage 1 passed but Stage 2 failed)
         if (lastStatus.value !== 'TRACKING') {
           lastStatus.value = 'TRACKING';
           handleStatusUpdateJS('TRACKING');
@@ -603,6 +685,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       }
       
       if (anchorDensity <= otherDensityAvg * 1.5) {
+        // Anchor not distinct enough - stay in TRACKING
         if (lastStatus.value !== 'TRACKING') {
           lastStatus.value = 'TRACKING';
           handleStatusUpdateJS('TRACKING');
@@ -610,16 +693,22 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         return;
       }
       
+      // ── STAGE 2 PASSED: Valid marker with anchor dot detected! ─────────────
       if (lastStatus.value !== 'CAPTURED') {
         lastStatus.value = 'CAPTURED';
         handleStatusUpdateJS('CAPTURED');
+        // Haptic feedback handled by useEffect state machine
       }
       
+      // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
+      // ── STEP 6: EXTRACT CORNERS (SIMPLE SCAN) ──────────────────────────────
+      // Scan only the bounding box region (not entire frame)
       let tlX = sourceWidth, tlY = sourceHeight, tlSum = sourceWidth + sourceHeight;
       let trX = 0, trY = sourceHeight, trDiff = -sourceWidth;
       let brX = 0, brY = 0, brSum = 0;
       let blX = sourceWidth, blY = 0, blDiff = sourceWidth;
       
+      // Scan with stride for speed
       for (let dy = minY; dy <= maxY; dy += 2) {
         const rowOffset = dy * sourceWidth;
         for (let dx = minX; dx <= maxX; dx += 2) {
@@ -637,6 +726,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         }
       }
       
+      // Corners are already in original coordinates (no scaling needed)
       const corners = {
         topLeft: { x: tlX, y: tlY },
         topRight: { x: trX, y: trY },
@@ -651,12 +741,14 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         h: h,
       };
 
+      // ── TRIGGER ──────────────────────────────────────────────────────────────
       // Lock the mutex IMMEDIATELY to prevent buffer overflow
       isProcessing.value = true;
       console.log('[Mutex] Locked - processing marker');
       
       lastDetectionTime.value = currentTime;
       
+      // Default rotation (no quadrant detection in fast mode)
       const rotation = 0;
       
       if (frameCounter.value % 20 === 0) {
@@ -666,6 +758,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       handleMarkerDetectedJS(scaledBox, corners, rotation, sourceWidth, sourceHeight);
     }, [isScanning]);
 
+    // ── Render ─────────────────────────────────────────────────────────────────
     if (!hasPermission) {
       return (
         <View style={styles.permissionContainer}>
@@ -681,6 +774,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
       );
     }
 
+    // ── Corner interpolations ──────────────────────────────────────────────────
     const cornerBorderColor = cornerAnim.interpolate({
       inputRange: [0, 1],
       outputRange: ['#ffffff', '#00FF00'],
@@ -693,6 +787,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
 
     return (
       <View style={styles.root}>
+        {/* ── Layer 1 (bottom): Camera preview with tap-to-focus ── */}
         {device != null ? (
           <GestureDetector gesture={tapGesture}>
             <View style={styles.cameraContainer}>
@@ -719,6 +814,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           </View>
         )}
 
+        {/* ── Layer 2: Viewfinder overlay ── */}
         <View style={styles.overlayTop} pointerEvents="none" />
         <View style={styles.overlayMiddleRow} pointerEvents="none">
           <View style={styles.overlaySide} />
@@ -777,6 +873,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
         </View>
         <View style={styles.overlayBottom} pointerEvents="none" />
 
+        {/* ── Layer 2.5: Detection box ── */}
         {detectionBox != null && (
           <View
             pointerEvents="none"
@@ -793,6 +890,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           />
         )}
 
+        {/* ── Layer 3: Bottom bar ── */}
         <View style={styles.bottomBar} pointerEvents="none">
           {capturedCount >= 20 ? (
             <View style={styles.completionContainer}>
@@ -812,6 +910,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           )}
         </View>
 
+        {/* ── Layer 4: Focus circle visual feedback ── */}
         {focusPoint && (
           <Animated.View
             style={[
@@ -834,6 +933,7 @@ import { extractAndProcessMarkerPerspective } from '../utils/imageProcessorPersp
           />
         )}
 
+        {/* ── Layer 5: Green capture flash ── */}
         <Animated.View
           style={[styles.flashOverlay, { opacity: flashAnim }]}
           pointerEvents="none"
